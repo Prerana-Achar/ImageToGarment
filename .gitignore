@@ -1,0 +1,53 @@
+# Python environments and caches
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Model weights and generated artifacts
+checkpoints/
+ckpts*/
+*.pt
+*.pth
+*.bin
+*.safetensors
+runs/
+outputs/
+output/
+wandb/
+
+# ChatGarment local assets/checkpoints
+ChatGarment/checkpoints/
+ChatGarment/ckpts*/
+ChatGarment/runs/
+ChatGarment/output/
+ChatGarment/wandb/
+ChatGarment/assets
+
+# GarmentCodeRC local configuration and generated files
+GarmentCodeRC/system.json
+GarmentCodeRC/Logs*/
+GarmentCodeRC/output*/
+GarmentCodeRC/tmp*/
+GarmentCodeRC/**/data_generation/Scenes/
+
+# Logs and temporary files
+*.log
+*.log.*
+*.jsonl
+tmp/
+*.tmp
+
+# Notebooks and editor files
+.ipynb_checkpoints/
+*.ipynb
+.vscode/
+.idea/
+*.code-workspace
+*.swp
+
+# OS files
+.DS_Store
+Thumbs.db
