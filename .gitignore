@@ -1,5 +1,6 @@
 # Python environments and caches
 venv/
+dinov2_venv/
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -32,6 +33,9 @@ GarmentCodeRC/Logs*/
 GarmentCodeRC/output*/
 GarmentCodeRC/tmp*/
 GarmentCodeRC/**/data_generation/Scenes/
+
+# DinoV2
+DINOv2
 
 # Logs and temporary files
 *.log
