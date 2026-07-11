@@ -20,19 +20,10 @@ output/
 wandb/
 
 # ChatGarment local assets/checkpoints
-ChatGarment/checkpoints/
-ChatGarment/ckpts*/
-ChatGarment/runs/
-ChatGarment/output/
-ChatGarment/wandb/
-ChatGarment/assets
+ChatGarment/
 
 # GarmentCodeRC local configuration and generated files
-GarmentCodeRC/system.json
-GarmentCodeRC/Logs*/
-GarmentCodeRC/output*/
-GarmentCodeRC/tmp*/
-GarmentCodeRC/**/data_generation/Scenes/
+GarmentCodeRC
 
 # DinoV2
 DINOv2
