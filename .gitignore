@@ -1,57 +1,42 @@
-# Python environments and caches
-venv/
-dinov2_venv/
-__pycache__/
-*.py[cod]
-*.egg-info/
-dist/
-build/
-
-# Model weights and generated artifacts
-checkpoints/
-ckpts*/
-*.pt
-*.pth
-*.bin
-*.safetensors
-runs/
-outputs/
-output/
-wandb/
-
-# ChatGarment local assets/checkpoints
-ChatGarment/checkpoints/
-ChatGarment/ckpts*/
-ChatGarment/runs/
-ChatGarment/output/
-ChatGarment/wandb/
-ChatGarment/assets
-
-# GarmentCodeRC local configuration and generated files
-GarmentCodeRC/system.json
-GarmentCodeRC/Logs*/
-GarmentCodeRC/output*/
-GarmentCodeRC/tmp*/
-GarmentCodeRC/**/data_generation/Scenes/
-
-# DinoV2
-DINOv2
-
-# Logs and temporary files
-*.log
-*.log.*
-*.jsonl
-tmp/
-*.tmp
-
-# Notebooks and editor files
-.ipynb_checkpoints/
-*.ipynb
+# OS and editor files
+.DS_Store
 .vscode/
 .idea/
-*.code-workspace
-*.swp
+*~
 
-# OS files
-.DS_Store
-Thumbs.db
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+.envs/
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Packaging and coverage output
+build/
+dist/
+*.egg-info/
+.coverage
+htmlcov/
+
+# Local dependencies, datasets, and generated artifacts
+third_party/
+GarmentImages/
+data/
+prepared_v2/
+runs/
+verify_dump/
+
+# Cluster logs
+slurm/logs/*.err
+slurm/logs/*.out
+
+# Git metadata is stored here in this managed workspace
+.repo-git/
