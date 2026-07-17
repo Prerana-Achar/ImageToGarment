@@ -108,7 +108,8 @@ class GarmentDinoModel(nn.Module):
         else:
             feat = self.backbone(image)
 
-        return self.reg_head(feat), self.cat_head(feat)
+        pred_reg = torch.sigmoid(self.reg_head(feat))
+        return pred_reg, self.cat_head(feat)
 
 
 def parse_args() -> argparse.Namespace:

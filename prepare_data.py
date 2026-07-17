@@ -724,12 +724,32 @@ class GarmentDataset(torch.utils.data.Dataset):
 
         if transform is None:
             from torchvision import transforms
-            self.transform = transforms.Compose([
-                transforms.Resize((image_size, image_size)),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225]),
-            ])
+            normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                             std=[0.229, 0.224, 0.225])
+            if self.train:
+                # Train-only, label-preserving augmentation. Photometric jitter
+                # plus mild scale/crop and occlusion regularise the shared DINOv2
+                # features (helping both heads and, in particular, curbing the
+                # categorical head's overconfidence). NO horizontal flip: the
+                # schema has left/right-asymmetric parameters (e.g. the "left"
+                # sleeve component), which a flip would silently mislabel.
+                self.transform = transforms.Compose([
+                    transforms.RandomResizedCrop(
+                        (image_size, image_size), scale=(0.85, 1.0), ratio=(0.9, 1.1)),
+                    transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2),
+                    transforms.GaussianBlur(3, sigma=(0.1, 1.5)),
+                    transforms.ToTensor(),
+                    normalize,
+                    transforms.RandomErasing(p=0.25, scale=(0.02, 0.1)),
+                ])
+            else:
+                # Validation / test stay deterministic so the metric is stable
+                # and comparable across epochs.
+                self.transform = transforms.Compose([
+                    transforms.Resize((image_size, image_size)),
+                    transforms.ToTensor(),
+                    normalize,
+                ])
         else:
             self.transform = transform
 

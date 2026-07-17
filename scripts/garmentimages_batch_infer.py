@@ -24,6 +24,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from dinov2_pipeline import (
     DEFAULT_MODEL_SCHEMA,
     ROOT,
+    build_grouped_inference_model,
     build_modelpy_inference_model,
     checkpoint_architecture,
     decode_modelpy_design,
@@ -52,6 +53,10 @@ MODEL_DEFAULTS = {
     "modelpy_all_images": {
         "checkpoint": ROOT / "runs" / "dinov2_modelpy_all_images" / "best.pt",
         "out_dir": ROOT / "runs" / "garmentimage_comparisons" / "modelpy_all_images",
+    },
+    "grouped": {
+        "checkpoint": ROOT / "runs" / "dinov2_grouped" / "best.pt",
+        "out_dir": ROOT / "runs" / "garmentimage_comparisons" / "dinov2_grouped",
     },
 }
 
@@ -85,7 +90,7 @@ def write_model_yaml(
     image = load_image(str(image_path), image_size, device)
     source = {"image": str(image_path)}
     with torch.inference_mode():
-        if architecture == "baseline":
+        if architecture in ("baseline", "grouped"):
             pred_reg, pred_logits = model(image)
             prediction = decode_baseline_prediction(pred_reg, pred_logits, checkpoint["schema"])
             result = {
@@ -200,7 +205,7 @@ def parse_args(default_model: str | None = None) -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--image-root", type=Path, default=ROOT / "GarmentImages")
     parser.add_argument("--out-dir", type=Path)
-    parser.add_argument("--architecture", choices=("auto", "baseline", "modelpy"), default="auto")
+    parser.add_argument("--architecture", choices=("auto", "baseline", "modelpy", "grouped"), default="auto")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--template", type=Path, default=DEFAULT_MODEL_SCHEMA)
     parser.add_argument("--source-mode", choices=("split", "wholebody", "all"), default="split")
@@ -258,6 +263,11 @@ def main(default_model: str | None = None) -> None:
 
     if detected == "baseline":
         model = build_baseline_inference_model(checkpoint, device)
+        adapter = None
+    elif detected == "grouped":
+        # Grouped forward matches the baseline output contract, so it reuses the
+        # baseline decode/YAML path below.
+        model = build_grouped_inference_model(checkpoint, device)
         adapter = None
     else:
         ns = SimpleNamespace(model_schema=str(args.model_schema) if args.model_schema else None,
