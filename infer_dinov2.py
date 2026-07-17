@@ -15,6 +15,7 @@ import yaml
 from PIL import Image
 from torchvision import transforms
 
+from model import UNSUPPORTED_GARMENTCODE_PARAMS
 from train_dinov2 import GarmentDinoModel
 
 TOP_PREFIXES = ("wholebody_garment", "upperbody_garment", "lowerbody_garment")
@@ -38,7 +39,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--template",
-        default="verify_dump/demo_design_v2_1327.yaml",
+        default="GarmentCodeRC/assets/design_params/default_new.yaml",
         help="GarmentCode design YAML/template carrying v/range/type fields",
     )
     parser.add_argument(
@@ -99,6 +100,8 @@ def build_model(ckpt: dict[str, Any], device: torch.device) -> GarmentDinoModel:
         hidden_dim=int(train_args.get("hidden_dim", 512)),
         dropout=float(train_args.get("dropout", 0.1)),
         freeze_backbone=not bool(train_args.get("unfreeze_backbone", False)),
+        # Old checkpoints trained before bounded regression used raw outputs.
+        bounded_regression=bool(train_args.get("bounded_regression", False)),
     )
     model.load_state_dict(ckpt["model"])
     return model.to(device).eval()
@@ -217,6 +220,8 @@ def prediction_to_design_yaml(
     warnings = []
 
     for full_path, norm_value in pred["continuous_norm"].items():
+        if strip_top_prefix(full_path) in UNSUPPORTED_GARMENTCODE_PARAMS:
+            continue
         if not allowed_path(full_path, source_mode):
             continue
         path = strip_top_prefix(full_path)
@@ -229,6 +234,8 @@ def prediction_to_design_yaml(
             warnings.append(f"{full_path}: {exc}")
 
     for full_path, raw_value in pred["constants_raw"].items():
+        if strip_top_prefix(full_path) in UNSUPPORTED_GARMENTCODE_PARAMS:
+            continue
         if not allowed_path(full_path, source_mode):
             continue
         path = strip_top_prefix(full_path)
@@ -238,6 +245,8 @@ def prediction_to_design_yaml(
             warnings.append(f"{full_path}: {exc}")
 
     for full_path, item in pred["categoricals"].items():
+        if strip_top_prefix(full_path) in UNSUPPORTED_GARMENTCODE_PARAMS:
+            continue
         if not allowed_path(full_path, source_mode):
             continue
         path = strip_top_prefix(full_path)

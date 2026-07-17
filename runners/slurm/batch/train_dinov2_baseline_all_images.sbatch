@@ -20,10 +20,11 @@ conda activate project
 export TORCH_HOME="${PROJECT_DIR}/.cache/torch"
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
 
-PREPARED_DIR="${PREPARED_DIR:-prepared_v2}"
+PREPARED_DIR="${PREPARED_DIR:-prepared_all}"
 OUT_DIR="${OUT_DIR:-runs/dinov2_baseline_all_images}"
 BACKBONE="${BACKBONE:-dinov2_vits14}"
-EPOCHS="${EPOCHS:-20}"
+EPOCHS="${EPOCHS:-1000}"
+SAVE_EVERY="${SAVE_EVERY:-100}"
 BATCH_SIZE="${BATCH_SIZE:-32}"
 LR="${LR:-1e-3}"
 LAMBDA_CAT="${LAMBDA_CAT:-1.0}"
@@ -53,6 +54,7 @@ srun python -u dinov2_pipeline.py train \
   --backbone "${BACKBONE}" \
   --mode all_images \
   --epochs "${EPOCHS}" \
+  --save-every "${SAVE_EVERY}" \
   --batch-size "${BATCH_SIZE}" \
   --num-workers "${SLURM_CPUS_PER_TASK:-8}" \
   --lr "${LR}" \

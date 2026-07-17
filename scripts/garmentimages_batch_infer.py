@@ -116,10 +116,15 @@ def write_model_yaml(
 
 
 def render_front_preview(yaml_path: Path, render_name: str, args: argparse.Namespace) -> Path:
-    render_python = ROOT / ".envs" / "garmentcode" / "bin" / "python"
+    # Do not resolve the interpreter symlink: resolving venv/bin/python to the
+    # system executable bypasses the venv and can mix binary package versions.
+    render_python = args.render_python.expanduser()
+    garmentcode_dir = args.garmentcode_dir.expanduser().resolve()
     render_script = ROOT / "render_garmentcode.py"
     if not render_python.is_file():
-        raise FileNotFoundError(f"GarmentCode Python environment not found: {render_python}")
+        raise FileNotFoundError(f"GarmentCode Python interpreter not found: {render_python}")
+    if not (garmentcode_dir / "assets" / "garment_programs").is_dir():
+        raise FileNotFoundError(f"GarmentCode checkout not found: {garmentcode_dir}")
 
     with tempfile.TemporaryDirectory(prefix="gc_render_") as tmp:
         temp_out = Path(tmp)
@@ -134,6 +139,8 @@ def render_front_preview(yaml_path: Path, render_name: str, args: argparse.Names
             str(temp_out),
             "--resolution-scale",
             str(args.render_resolution_scale),
+            "--garmentcode-dir",
+            str(garmentcode_dir),
         ]
         for field in ("upper", "wb", "bottom"):
             value = getattr(args, f"render_{field}")
@@ -209,6 +216,18 @@ def parse_args(default_model: str | None = None) -> argparse.Namespace:
     parser.add_argument("--limit", type=int, help="process only the first N images")
     parser.add_argument("--skip-existing", action="store_true")
     parser.add_argument("--render-resolution-scale", type=float, default=3.0)
+    parser.add_argument(
+        "--render-python",
+        type=Path,
+        default=PROJECT_ROOT / "venv" / "bin" / "python",
+        help="Python interpreter with Warp, PyRender, and GarmentCode dependencies",
+    )
+    parser.add_argument(
+        "--garmentcode-dir",
+        type=Path,
+        default=PROJECT_ROOT / "GarmentCodeRC",
+        help="GarmentCodeRC checkout containing assets and pygarment",
+    )
     parser.add_argument("--max-sim-steps", type=int)
     parser.add_argument("--max-sim-time", type=int)
     parser.add_argument("--render-upper", choices=("none", "FittedShirt", "Shirt"))

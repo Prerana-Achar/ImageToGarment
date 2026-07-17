@@ -673,12 +673,12 @@ class GarmentDataset(torch.utils.data.Dataset):
     image_size : int
         Square resize applied by the default transform.
     transform : callable, optional
-        Torchvision-style transform mapping a PIL image to a tensor.  Defaults
-        to Resize -> ToTensor -> ImageNet normalisation.
+        Torchvision-style transform mapping a PIL image to a tensor. Defaults
+        to light train augmentation or deterministic resize for evaluation.
     """
 
     def __init__(self, prepared_dir, split, mode="single", train=True,
-                 image_size=224, transform=None):
+                 image_size=224, transform=None, augmentation="light"):
         if mode not in ("single", "all_images"):
             raise ValueError(f"Unknown mode {mode!r}; expected 'single' or 'all_images'")
         self.prepared_dir = prepared_dir
@@ -708,10 +708,15 @@ class GarmentDataset(torch.utils.data.Dataset):
         self.y_const_raw = npz["y_const"]
         ranges = np.array(list(self.schema["const_ranges"].values()),
                           dtype=np.float32)          # [n_const, 2]
-        lo, hi = ranges[:, 0], ranges[:, 1]
-        span = np.maximum(hi - lo, 1e-8)
-        self.y_const = ((self.y_const_raw - lo) / span).astype(np.float32)
-        self.y_const *= self.const_mask                # keep inactive slots at 0
+        if ranges.size:
+            ranges = ranges.reshape(-1, 2)
+            lo, hi = ranges[:, 0], ranges[:, 1]
+            span = np.maximum(hi - lo, 1e-8)
+            self.y_const = ((self.y_const_raw - lo) / span).astype(np.float32)
+            self.y_const *= self.const_mask            # keep inactive slots at 0
+        else:
+            lo = hi = np.zeros((0,), dtype=np.float32)
+            self.y_const = self.y_const_raw.astype(np.float32, copy=False)
         self.const_lo, self.const_hi = lo, hi
 
         # Keep only garments present in every required structure.
@@ -722,14 +727,49 @@ class GarmentDataset(torch.utils.data.Dataset):
         self.image_samples = []
         self.refresh_samples()
 
+        if augmentation not in ("none", "light"):
+            raise ValueError(f"Unknown augmentation {augmentation!r}; expected 'none' or 'light'")
+
         if transform is None:
             from torchvision import transforms
-            self.transform = transforms.Compose([
-                transforms.Resize((image_size, image_size)),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225]),
-            ])
+            if train and augmentation == "light":
+                # Keep geometry changes mild: garment labels can encode small
+                # shape details, and horizontal flips may change semantics.
+                self.transform = transforms.Compose([
+                    transforms.RandomResizedCrop(
+                        image_size,
+                        scale=(0.88, 1.0),
+                        ratio=(0.92, 1.08),
+                        interpolation=transforms.InterpolationMode.BICUBIC,
+                    ),
+                    transforms.RandomApply([
+                        transforms.ColorJitter(
+                            brightness=0.15,
+                            contrast=0.15,
+                            saturation=0.10,
+                            hue=0.02,
+                        )
+                    ], p=0.8),
+                    transforms.RandomApply([
+                        transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0))
+                    ], p=0.1),
+                    transforms.ToTensor(),
+                    transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                         std=[0.229, 0.224, 0.225]),
+                    transforms.RandomErasing(
+                        p=0.1,
+                        scale=(0.02, 0.08),
+                        ratio=(0.5, 2.0),
+                        value="random",
+                    ),
+                ])
+            else:
+                self.transform = transforms.Compose([
+                    transforms.Resize((image_size, image_size)),
+                    transforms.ToTensor(),
+                    transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                         std=[0.229, 0.224, 0.225]),
+                ])
         else:
             self.transform = transform
 

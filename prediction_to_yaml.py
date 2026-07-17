@@ -20,7 +20,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prediction", required=True, help="JSON written by infer_dinov2.py")
     parser.add_argument(
         "--template",
-        default="verify_dump/demo_design_v2_1327.yaml",
+        default="GarmentCodeRC/assets/design_params/default_new.yaml",
         help="GarmentCode design YAML/template carrying v/range/type fields",
     )
     parser.add_argument("--out", required=True, help="output design YAML")

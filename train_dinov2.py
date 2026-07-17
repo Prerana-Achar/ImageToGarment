@@ -26,8 +26,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
+from model import UNSUPPORTED_GARMENTCODE_PARAMS
 from prepare_data import GarmentDataset
 
+
+def make_grad_scaler(enabled: bool) -> Any:
+    scaler_cls = getattr(getattr(torch, "amp", None), "GradScaler", None)
+    if scaler_cls is None:
+        scaler_cls = torch.cuda.amp.GradScaler
+    return scaler_cls(enabled=enabled)
 
 @dataclass
 class BatchStats:
@@ -63,10 +70,12 @@ class GarmentDinoModel(nn.Module):
         hidden_dim: int,
         dropout: float,
         freeze_backbone: bool,
+        bounded_regression: bool = True,
     ) -> None:
         super().__init__()
         self.backbone = torch.hub.load("facebookresearch/dinov2", backbone_name)
         self.freeze_backbone = freeze_backbone
+        self.bounded_regression = bounded_regression
         self.cat_vocab_sizes = cat_vocab_sizes
 
         embed_dim = self._infer_embed_dim()
@@ -108,17 +117,22 @@ class GarmentDinoModel(nn.Module):
         else:
             feat = self.backbone(image)
 
-        return self.reg_head(feat), self.cat_head(feat)
+        regression = self.reg_head(feat)
+        if self.bounded_regression:
+            regression = torch.sigmoid(regression)
+        return regression, self.cat_head(feat)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--prepared-dir", default="prepared_v2")
     parser.add_argument("--out-dir", default="runs/dinov2_vits14")
-    parser.add_argument("--backbone", default="dinov2_vits14")
+    parser.add_argument("--backbone", default="dinov2_vitl14")
     parser.add_argument("--mode", choices=("single", "all_images"), default="single")
+    parser.add_argument("--augmentation", choices=("none", "light"), default="light")
     parser.add_argument("--image-size", type=int, default=224)
-    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--epochs", type=int, default=1000)
+    parser.add_argument("--save-every", type=int, default=100, help="save numbered checkpoints every N epochs; 0 disables")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -126,6 +140,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hidden-dim", type=int, default=512)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--lambda-cat", type=float, default=1.0)
+    parser.add_argument(
+        "--unbounded-regression",
+        action="store_false",
+        dest="bounded_regression",
+        help="legacy mode: do not apply sigmoid to baseline regression outputs",
+    )
+    parser.set_defaults(bounded_regression=True)
     parser.add_argument("--unfreeze-backbone", action="store_true")
     parser.add_argument("--amp", action="store_true", help="use CUDA mixed precision")
     parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"))
@@ -146,11 +167,42 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="do not filter missing image paths after prefix rewrites",
     )
+    parser.add_argument("--allow-unbalanced-data", action="store_true",
+                        help="override a failed balance_report.json readiness gate")
     return parser.parse_args()
 
 
 def cat_vocab_sizes(schema: dict[str, Any]) -> list[int]:
     return [len(vocab) for vocab in schema["cat_vocab"].values()]
+
+
+def strip_target_prefix(path: str) -> str:
+    parts = path.split(".")
+    if parts and parts[0] in {
+        "wholebody_garment",
+        "upperbody_garment",
+        "lowerbody_garment",
+    }:
+        return ".".join(parts[1:])
+    return path
+
+
+def disable_unsupported_targets(ds: GarmentDataset) -> list[str]:
+    """Remove legacy targets from baseline loss masks without changing tensor shape."""
+    ignored: list[str] = []
+    for path, index in ds.schema["cont_slots"].items():
+        if strip_target_prefix(path) in UNSUPPORTED_GARMENTCODE_PARAMS:
+            ds.mask[:, int(index)] = 0
+            ignored.append(path)
+    for path, index in ds.schema["const_slots"].items():
+        if strip_target_prefix(path) in UNSUPPORTED_GARMENTCODE_PARAMS:
+            ds.const_mask[:, int(index)] = 0
+            ignored.append(path)
+    for index, path in enumerate(ds.schema["cat_vocab"]):
+        if strip_target_prefix(path) in UNSUPPORTED_GARMENTCODE_PARAMS:
+            ds.y_cat[:, index] = -1
+            ignored.append(path)
+    return ignored
 
 
 def rewrite_and_filter_images(ds: GarmentDataset, rewrites: list[list[str]], keep_missing: bool) -> None:
@@ -185,6 +237,15 @@ def rewrite_and_filter_images(ds: GarmentDataset, rewrites: list[list[str]], kee
 
 
 def make_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader, dict[str, Any]]:
+    report_path = Path(args.prepared_dir) / "balance_report.json"
+    if report_path.is_file():
+        with open(report_path) as handle:
+            balance_report = json.load(handle)
+        if not balance_report.get("ready", False) and not getattr(args, "allow_unbalanced_data", False):
+            raise RuntimeError(
+                f"Prepared dataset is not training-ready: {report_path}. "
+                "Fix the reported deficits or explicitly pass --allow-unbalanced-data."
+            )
     with open(Path(args.prepared_dir) / "schema.json") as f:
         schema = json.load(f)
 
@@ -194,6 +255,7 @@ def make_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader, dict
         mode=args.mode,
         train=True,
         image_size=args.image_size,
+        augmentation=args.augmentation,
     )
     val_ds = GarmentDataset(
         args.prepared_dir,
@@ -201,7 +263,16 @@ def make_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader, dict
         mode=args.mode,
         train=False,
         image_size=args.image_size,
+        augmentation="none",
     )
+    ignored_targets = disable_unsupported_targets(train_ds)
+    disable_unsupported_targets(val_ds)
+    if ignored_targets:
+        print(
+            f"[data] disabled unsupported targets: {', '.join(sorted(ignored_targets))}",
+            flush=True,
+        )
+
     if args.image_path_prefix or not args.keep_missing_images:
         rewrite_and_filter_images(train_ds, args.image_path_prefix, args.keep_missing_images)
         rewrite_and_filter_images(val_ds, args.image_path_prefix, args.keep_missing_images)
@@ -280,7 +351,7 @@ def run_epoch(
     model: GarmentDinoModel,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer | None,
-    scaler: torch.amp.GradScaler,
+    scaler: Any,
     device: torch.device,
     vocab_sizes: list[int],
     lambda_cat: float,
@@ -379,6 +450,7 @@ def main() -> None:
         hidden_dim=args.hidden_dim,
         dropout=args.dropout,
         freeze_backbone=not args.unfreeze_backbone,
+        bounded_regression=args.bounded_regression,
     ).to(device)
 
     optimizer = torch.optim.AdamW(
@@ -386,7 +458,7 @@ def main() -> None:
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
-    scaler = torch.amp.GradScaler(enabled=args.amp and device.type == "cuda")
+    scaler = make_grad_scaler(enabled=args.amp and device.type == "cuda")
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -449,6 +521,8 @@ def main() -> None:
             best_val = val_metrics["loss"]
             save_checkpoint(out_dir / "best.pt", model, optimizer, epoch, best_val, args, schema)
         save_checkpoint(out_dir / "last.pt", model, optimizer, epoch, best_val, args, schema)
+        if args.save_every > 0 and epoch % args.save_every == 0:
+            save_checkpoint(out_dir / f"epoch_{epoch:04d}.pt", model, optimizer, epoch, best_val, args, schema)
 
         with open(out_dir / "history.json", "w") as f:
             json.dump({"args": vars(args), "history": history}, f, indent=2)

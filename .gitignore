@@ -18,6 +18,7 @@ runs/
 outputs/
 output/
 wandb/
+runs/condor/logs
 
 # ChatGarment local assets/checkpoints
 ChatGarment/
@@ -78,3 +79,13 @@ slurm/logs/*.out
 
 # Git metadata is stored here in this managed workspace
 .repo-git/
+
+# Condor logs
+runners/condor/logs/*.err
+runners/condor/logs/*.out
+runners/condor/logs/*.log
+runners/condor/logs/*.log.*
+runners/condor/logs/**
+
+# Local Condor secrets
+runners/condor/secrets.sh

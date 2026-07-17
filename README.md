@@ -5,6 +5,23 @@ Turns the raw [ChatGarment dataset](https://huggingface.co/datasets/sy000/ChatGa
 PyTorch image → sewing-pattern model. One command produces four files and a
 ready-to-use `GarmentDataset`.
 
+## Cluster Quick Start
+
+To fetch v1/v2/v3/v4 and build the combined training manifest on the cluster:
+
+```bash
+cd /is/cluster/pachar/Projects/ImageToGarment
+bash scripts/fetch_all_fast_data.sh
+```
+
+This writes `/is/cluster/fast/pachar/Data/ImageToGarment/prepared_all`, which the Condor training runner uses by default.
+
+To skip the very large v1 rest-pose shards and prepare v2/v3/v4 only:
+
+```bash
+INCLUDE_V1=0 bash scripts/fetch_all_fast_data.sh
+```
+
 ---
 
 ## 1. What the raw data is
@@ -236,8 +253,8 @@ types appear in all three splits.
 from prepare_data import GarmentDataset
 from torch.utils.data import DataLoader
 
-train_ds = GarmentDataset("prepared_v2", split="train", mode="single", train=True)
-val_ds   = GarmentDataset("prepared_v2", split="val",   mode="single", train=False)
+train_ds = GarmentDataset("prepared_all", split="train", mode="single", train=True)
+val_ds   = GarmentDataset("prepared_all", split="val",   mode="single", train=False)
 
 loader = DataLoader(train_ds, batch_size=64, shuffle=True, num_workers=8)
 batch  = next(iter(loader))
@@ -294,7 +311,7 @@ and `config.json`.
 
 ```bash
 conda run -n project python train_dinov2.py \
-  --prepared-dir prepared_v2 \
+  --prepared-dir prepared_all \
   --out-dir runs/dinov2_vits14 \
   --epochs 20 \
   --batch-size 32 \
@@ -303,12 +320,12 @@ conda run -n project python train_dinov2.py \
   --amp
 ```
 
-If `prepared_v2/images.json` was created on another machine, rewrite the stored
+If `prepared_all/images.json` was created on another machine, rewrite the stored
 absolute image prefix at load time:
 
 ```bash
 conda run -n project python train_dinov2.py \
-  --prepared-dir prepared_v2 \
+  --prepared-dir prepared_all \
   --out-dir runs/dinov2_vits14 \
   --image-path-prefix \
     /Users/siddharth/Study/3dv_project/data/chatgarment_data/garments_imgs_v2_3 \
@@ -335,8 +352,7 @@ constants:           raw = lo + pred * (hi - lo)         # lo,hi from schema.jso
 categoricals:        value = cat_vocab[field][argmax(logits_field)]
 ```
 
-then write into GarmentCode's design template (see `make_garmentcode_design.py`,
-which does exactly this for GT verification) and upload to the GarmentCode GUI.
+then write into GarmentCode's design template with `prediction_to_yaml.py` or the integrated `dinov2_pipeline.py infer` path.
 
 ### ⚠ Do NOT blindly round all constants
 
@@ -345,8 +361,7 @@ Constants sit on integer grids **except two float-valued ones**:
 `lowerbody_garment` and `wholebody_garment`. Rounding those to integers corrupts
 them. The correct rule is **round only `type: int` params**, leave `type: float`
 alone — the type comes from GarmentCode's `assets/design_params/default.yaml`.
-`make_garmentcode_design.py`'s `set_nested()` already casts by declared type and is
-correct. **`schema.json` does not yet record this int/float type** — if you build a
+`prediction_to_yaml.py` casts by declared type from the GarmentCode template. **`schema.json` does not yet record this int/float type** — if you build a
 standalone decoder off `schema.json` alone, add the type lookup from `default.yaml`
 (or extend the schema to carry `const_types`).
 
@@ -388,8 +403,10 @@ standalone decoder off `schema.json` alone, add the type lookup from `default.ya
 
 ## 8. File map
 
-| file                         | role                                                            |
-| ---------------------------- | --------------------------------------------------------------- |
-| `prepare_data.py`            | this pipeline +`GarmentDataset`                                 |
-| `make_garmentcode_design.py` | decode one gid's GT to a GarmentCode design yaml (verification) |
-| `verify_dump.py`             | human-readable dump of parsed targets for eyeballing            |
+| file                     | role                                                      |
+| ------------------------ | --------------------------------------------------------- |
+| `prepare_data.py`        | data preparation pipeline and `GarmentDataset`            |
+| `dinov2_pipeline.py`     | train/infer entrypoint for baseline and model.py multihead |
+| `model.py`               | DINOv2 encoder plus per-parameter multihead MLP           |
+| `prediction_to_yaml.py`  | decode predictions into a GarmentCode design yaml         |
+| `render_garmentcode.py`  | render decoded GarmentCode outputs                        |
