@@ -36,6 +36,7 @@ tmp/
 *.tmp
 
 # Notebooks and editor files
+.DS_Store
 .ipynb_checkpoints/
 *.ipynb
 .vscode/
