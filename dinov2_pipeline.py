@@ -845,10 +845,43 @@ def train(args: argparse.Namespace) -> None:
 def checkpoint_architecture(checkpoint: dict[str, Any]) -> str:
     architecture = checkpoint.get("architecture")
     if architecture is None:
-        architecture = checkpoint.get("args", {}).get("architecture", "baseline")
-    if architecture not in {"baseline", "modelpy"}:
+        # The grouped trainer stamps a ``format`` field rather than an
+        # ``architecture`` one; detect it before falling back to the baseline.
+        fmt = checkpoint.get("format")
+        if isinstance(fmt, str) and fmt.startswith("dinov2_grouped"):
+            architecture = "grouped"
+        else:
+            architecture = checkpoint.get("args", {}).get("architecture", "baseline")
+    if architecture not in {"baseline", "modelpy", "grouped"}:
         raise ValueError(f"Unknown checkpoint architecture: {architecture!r}")
     return architecture
+
+
+def build_grouped_inference_model(
+    checkpoint: dict[str, Any],
+    device: torch.device,
+) -> nn.Module:
+    """Rebuild a ``GroupedGarmentDinoModel`` and load its weights for inference.
+
+    The grouped forward returns ``(pred_reg, pred_logits)`` in the same full
+    schema order as the baseline (regression is ``[y_cont | y_const]``, logits
+    are the packed per-field vocab), so the baseline decoder handles its output
+    unchanged.
+    """
+    from train_dinov2_grouped import GroupedGarmentDinoModel
+
+    train_args = checkpoint["args"]
+    model = GroupedGarmentDinoModel(
+        schema=checkpoint["schema"],
+        backbone_name=train_args.get("backbone", "dinov2_vits14"),
+        hidden_dim=int(train_args.get("hidden_dim", 512)),
+        branch_hidden_dim=int(train_args.get("branch_hidden_dim", 128)),
+        waistband_hidden_dim=int(train_args.get("waistband_hidden_dim", 64)),
+        dropout=float(train_args.get("dropout", 0.1)),
+        freeze_backbone=not bool(train_args.get("unfreeze_backbone", False)),
+    )
+    model.load_state_dict(checkpoint["model"])
+    return model.to(device).eval()
 
 
 def embedded_schema_file(checkpoint: dict[str, Any]) -> str:
