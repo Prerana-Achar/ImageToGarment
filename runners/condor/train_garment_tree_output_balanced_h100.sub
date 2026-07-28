@@ -1,0 +1,24 @@
+universe = vanilla
+initialdir = /is/cluster/pachar/Projects/ImageToGarment
+executable = /bin/bash
+arguments = runners/condor/run_train_garment_tree_output_balanced_h100.sh
+
+getenv = True
+should_transfer_files = NO
+
+PROJECT_DIR = /is/cluster/pachar/Projects/ImageToGarment
+LOG_ROOT = $(PROJECT_DIR)/runners/condor/logs
+log = $(LOG_ROOT)/$(log_dir)/job.log
+output = $(LOG_ROOT)/$(log_dir)/job.out
+error = $(LOG_ROOT)/$(log_dir)/job.err
+
+request_gpus = 1
+request_cpus = 8
+request_memory = 64GB
+request_disk = 20GB
+requirements = (TARGET.CUDACapability == 9.0 && TARGET.CUDAGlobalMemoryMb >= 80000 && UtsnameNodename =!= "i103" && UtsnameNodename =!= "g158" && UtsnameNodename =!= "g164" && UtsnameNodename =!= "g174")
+
+environment = "PROJECT_DIR=/is/cluster/pachar/Projects/ImageToGarment DATA_ROOT=/is/cluster/fast/pachar/Data PREPARED_DIR=/is/cluster/fast/pachar/Data/ImageToGarment/prepared_smplx_output_balanced OUT_DIR=/is/cluster/pachar/Projects/ImageToGarment/runs/$(log_dir)_garment_tree_foundation_small_dd EPOCHS=500 MIN_EPOCHS=500 PATIENCE=500 BATCH_SIZE=24 NUM_WORKERS=8 IMAGE_SIZE=336 LR=2e-4 MIN_LR=1e-6 WARMUP_EPOCHS=10 WEIGHT_DECAY=0.02 LABEL_SMOOTHING=0.0 LAMBDA_ORDINAL=0.20 LAMBDA_CONSISTENCY=0.10 TEACHER_FORCE_EPOCHS=100 DROPOUT=0.10 DROP_PATH=0.10 WANDB_PROJECT=ImageToGarment WANDB_ENTITY=draping WANDB_MODE=online"
+
+queue 1
+

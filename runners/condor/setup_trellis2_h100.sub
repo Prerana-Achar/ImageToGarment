@@ -1,0 +1,29 @@
+# Submit through runners/condor/submit_setup_trellis2_h100.sh.
+# This job builds/installs TRELLIS.2 dependencies into the existing repo venv.
+
+universe = vanilla
+initialdir = /is/cluster/pachar/Projects/ImageToGarment
+executable = /bin/bash
+arguments = runners/condor/run_setup_trellis2_h100.sh
+
+getenv = True
+should_transfer_files = NO
+
+LOG_PATH = runners/condor/logs/$(log_dir)/
+log = $(LOG_PATH)job.log
+output = $(LOG_PATH)job.out
+error = $(LOG_PATH)job.err
+
+# Generous setup/build request. TRELLIS.2 needs 24GB+ VRAM; H100 gives enough
+# headroom for CUDA extension builds, smoke tests, and first model downloads.
+request_gpus = 1
+request_cpus = 16
+request_memory = 128GB
+request_disk = 100GB
+requirements = (TARGET.CUDACapability == 9.0 && TARGET.CUDAGlobalMemoryMb >= 80000 && UtsnameNodename =!= "i103" && UtsnameNodename =!= "g158" && UtsnameNodename =!= "g164" && UtsnameNodename =!= "g174")
+
++MaxRuntime = 28800
+
+environment = "PROJECT_DIR=/is/cluster/pachar/Projects/ImageToGarment VENV_DIR=/is/cluster/pachar/Projects/ImageToGarment/venv SETUP_ROOT=/is/cluster/fast/pachar/Data/ImageToGarment/trellis2_setup LOG_DIR=$(log_dir) REBUILD_EXTENSIONS=0"
+
+queue 1

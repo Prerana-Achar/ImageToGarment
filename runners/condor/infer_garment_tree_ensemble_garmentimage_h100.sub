@@ -1,0 +1,18 @@
+universe = vanilla
+initialdir = /is/cluster/pachar/Projects/ImageToGarment
+executable = /bin/bash
+arguments = runners/condor/run_infer_garment_tree_ensemble_garmentimage_h100.sh
+getenv = True
+should_transfer_files = NO
+PROJECT_DIR = /is/cluster/pachar/Projects/ImageToGarment
+LOG_ROOT = $(PROJECT_DIR)/runners/condor/logs
+log = $(LOG_ROOT)/$(log_dir)/job.log
+output = $(LOG_ROOT)/$(log_dir)/job.out
+error = $(LOG_ROOT)/$(log_dir)/job.err
+request_gpus = 1
+request_cpus = 8
+request_memory = 96GB
+request_disk = 80GB
+requirements = (TARGET.CUDACapability == 9.0 && TARGET.CUDAGlobalMemoryMb >= 80000 && UtsnameNodename =!= "i103" && UtsnameNodename =!= "g158" && UtsnameNodename =!= "g164" && UtsnameNodename =!= "g174")
+environment = "PROJECT_DIR=/is/cluster/pachar/Projects/ImageToGarment CHECKPOINT=$(checkpoint) IMAGE_ROOT=$(image_root) OUT_DIR=$(out_dir) LIMIT=$(limit)"
+queue 1

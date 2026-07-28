@@ -1,0 +1,17 @@
+universe = vanilla
+initialdir = /is/cluster/pachar/Projects/ImageToGarment
+executable = /bin/bash
+arguments = runners/condor/run_train_chatgarment_smplx_h100.sh
+getenv = True
+should_transfer_files = NO
+LOG_PATH = runners/condor/logs/$(log_dir)/
+log = $(LOG_PATH)job.log
+output = $(LOG_PATH)job.out
+error = $(LOG_PATH)job.err
+request_gpus = 1
+request_cpus = 8
+request_memory = 96GB
+request_disk = 50GB
+requirements = (TARGET.CUDACapability == 9.0 && TARGET.CUDAGlobalMemoryMb >= 80000 && UtsnameNodename =!= "i103" && UtsnameNodename =!= "g158" && UtsnameNodename =!= "g164" && UtsnameNodename =!= "g174")
+environment = "PROJECT_DIR=/is/cluster/pachar/Projects/ImageToGarment DATA_DIR=/is/cluster/fast/pachar/Data/ChatGarmentSMPLXVLM RUN_ROOT=/is/cluster/pachar/Projects/ImageToGarment/runs/chatgarment_smplx RUN_NAME=$(run_name) EPOCHS=20 BATCH_SIZE=2 EVAL_BATCH_SIZE=2 GRAD_ACCUM=8 NUM_WORKERS=8 LR=1e-4 WEIGHT_DECAY=0.01 LORA_R=64 LORA_ALPHA=128 LORA_DROPOUT=0.1 WANDB_PROJECT=ImageToGarment WANDB_MODE=online"
+queue 1

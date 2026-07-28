@@ -1,6 +1,72 @@
 # Condor DINOv2 Training
+## Current GarmentCodeSMPLX dataset
+
+Training now defaults to the ground-truth sample folders under:
+
+```text
+/is/cluster/fast/pachar/Data/GarmentCodeSMPLX/train/samples
+```
+
+Prepare the latest completed samples before submitting jobs:
+
+```bash
+cd /is/cluster/pachar/Projects/ImageToGarment
+bash scripts/prepare_smplx_data.sh
+```
+
+The preparer requires `pose1`, `pose2`, and `pose3`. It preserves raw
+`design_values` and masks targets with `design_active_paths`. Because this
+dataset currently has no `val/` folder, the preparer selects 10% of unique
+bodies using a deterministic stratified score over garment count, garment
+categories, and active categorical labels. Every garment and all three poses
+belonging to a held-out body stay in validation. The selected bodies, score,
+and score components are written to `split_selection.json`. Each pose is one
+independent image item; the model never receives multiple poses together.
+The training DataLoader uses `mode=all_images` and reshuffles those items every
+epoch.
+
+Change the holdout without changing code by setting, for example,
+`VAL_FRACTION_OF_TRAIN_BODIES=0.15`. While generation is incomplete, the wrapper
+writes an auditable export, but the readiness gate can still reject incomplete
+or unbalanced data.
+
+Prepared files are written to:
+
+```text
+/is/cluster/fast/pachar/Data/ImageToGarment/prepared_smplx
+```
+
+Submit any of the three models:
+
+```bash
+bash runners/condor/submit_h100.sh smplx_baseline baseline 150
+bash runners/condor/submit_h100.sh smplx_multihead modelpy 150
+bash runners/condor/submit_h100.sh smplx_grouped grouped 150
+```
+
+Rerun `scripts/prepare_smplx_data.sh` after more pose renders finish, then submit
+a new cohort of runs so all compared models use the same frozen split.
 
 These files run the shared `dinov2_pipeline.py` training entrypoint on one H100.
+
+
+## Training While Generation Is Running
+
+The preparer scans every sample folder and includes a garment only when its JSON,
+PKL, `pose1`, `pose2`, and `pose3` files are present and readable. Unfinished
+folders are listed in `balance_report.json` and skipped. The Condor runner sets
+`ALLOW_UNBALANCED_DATA=1`, so this partial report is a warning and does not block
+training.
+
+```bash
+cd /is/cluster/pachar/Projects/ImageToGarment
+bash scripts/prepare_smplx_data.sh
+bash runners/condor/submit_h100.sh smplx_partial modelpy 150
+```
+
+Rerun preparation and submit a fresh run whenever you want to include newly
+completed folders. Set `ALLOW_UNBALANCED_DATA=0` for final runs that should fail
+unless the readiness report passes.
 
 ## 1. Fetch and prepare all data
 
@@ -66,7 +132,7 @@ mkdir -p runners/condor/logs
 bash runners/condor/submit_h100.sh garment_multihead_all modelpy
 ```
 
-Training uses `/is/cluster/fast/pachar/Data/ImageToGarment/prepared_all` by default. To force a different prepared dataset:
+The legacy ChatGarment preparer below writes `prepared_all`. To train on it instead of the current SMPL-X default, explicitly override `PREPARED_DIR`:
 
 ```bash
 PREPARED_DIR=/is/cluster/fast/pachar/Data/ImageToGarment/prepared_v2 \
@@ -100,6 +166,7 @@ The H100 runner now uses regularized defaults for the overfitting regime:
 
 ```text
 DROPOUT=0.4
+SHARED_HIDDEN_DIM=256
 HEAD_HIDDEN_DIMS=64 32
 WEIGHT_DECAY=3e-3
 HEAD_LAYER_NORM=1
@@ -113,6 +180,10 @@ GRAD_CLIP_NORM=1.0
 LR_PLATEAU_PATIENCE=5
 EARLY_STOPPING_PATIENCE=20
 ```
+
+Label smoothing and class weighting apply only to the training objective. Validation
+uses plain, unweighted cross-entropy so confidence and checkpoint selection are
+measured consistently.
 
 Override any of these in the submit environment or before calling the payload if validation loss starts underfitting.
 

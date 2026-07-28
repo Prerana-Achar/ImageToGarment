@@ -1,8 +1,8 @@
 # Submit through runners/condor/submit_h100.sh so the cluster bid is set.
 # Example:
-#   bash runners/condor/submit_h100.sh modelpy_test modelpy
+#   bash runners/condor/submit_h100.sh garment_grouped grouped
 
-# The submit wrapper supplies $(architecture) as either modelpy or baseline.
+# The submit wrapper supplies $(architecture) as modelpy, baseline, or grouped.
 
 universe = vanilla
 initialdir = /is/cluster/pachar/Projects/ImageToGarment
@@ -25,6 +25,6 @@ request_memory = 64GB
 request_disk = 20GB
 requirements = (TARGET.CUDACapability == 9.0 && TARGET.CUDAGlobalMemoryMb >= 80000 && UtsnameNodename =!= "i103" && UtsnameNodename =!= "g158" && UtsnameNodename =!= "g164" && UtsnameNodename =!= "g174")
 
-environment = "PROJECT_DIR=/is/cluster/pachar/Projects/ImageToGarment DATA_ROOT=/is/cluster/fast/pachar/Data PREPARED_DIR=/is/cluster/fast/pachar/Data/ImageToGarment/prepared_all RUN_ROOT=/is/cluster/pachar/Projects/ImageToGarment/runs OUT_DIR=/is/cluster/pachar/Projects/ImageToGarment/runs/$(log_dir)_$(architecture) EPOCHS=1000 SAVE_EVERY=100 BATCH_SIZE=64 NUM_WORKERS=8 LR=3e-4 WEIGHT_DECAY=3e-3 LAMBDA_CAT=1.0 DROPOUT=0.4 HEAD_LAYER_NORM=1 LABEL_SMOOTHING=0.05 REG_LOSS=smooth_l1 SMOOTH_L1_BETA=0.05 GRAD_CLIP_NORM=1.0 LR_PLATEAU_PATIENCE=5 LR_PLATEAU_FACTOR=0.5 MIN_LR=1e-6 EARLY_STOPPING_PATIENCE=20 MIN_DELTA=5e-4 BACKBONE=dinov2_vitl14 MODE=all_images AUGMENTATION=light CLASS_WEIGHTING=effective CLASS_WEIGHT_BETA=0.999 CLASS_WEIGHT_MAX=5.0 WANDB=1 WANDB_PROJECT=ImageToGarment WANDB_MODE=online"
+environment = "PROJECT_DIR=/is/cluster/pachar/Projects/ImageToGarment DATA_ROOT=/is/cluster/fast/pachar/Data PREPARED_DIR=/is/cluster/fast/pachar/Data/ImageToGarment/prepared_smplx RUN_ROOT=/is/cluster/pachar/Projects/ImageToGarment/runs OUT_DIR=/is/cluster/pachar/Projects/ImageToGarment/runs/$(log_dir)_$(architecture) EPOCHS=1000 SAVE_EVERY=100 BATCH_SIZE=64 NUM_WORKERS=8 LR=3e-4 WEIGHT_DECAY=3e-3 LAMBDA_CAT=1.0 DROPOUT=0.4 HEAD_LAYER_NORM=1 LABEL_SMOOTHING=0.05 REG_LOSS=smooth_l1 SMOOTH_L1_BETA=0.05 GRAD_CLIP_NORM=1.0 LR_PLATEAU_PATIENCE=5 LR_PLATEAU_FACTOR=0.5 MIN_LR=1e-6 EARLY_STOPPING_PATIENCE=20 MIN_DELTA=5e-4 BACKBONE=dinov2_vitl14 MODE=all_images AUGMENTATION=light ALLOW_UNBALANCED_DATA=1 CLASS_WEIGHTING=effective CLASS_WEIGHT_BETA=0.999 CLASS_WEIGHT_MAX=5.0 WANDB=1 WANDB_PROJECT=ImageToGarment WANDB_MODE=online"
 
 queue 1

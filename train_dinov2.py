@@ -42,6 +42,8 @@ class BatchStats:
     loss_reg: float = 0.0
     loss_cat: float = 0.0
     cat_acc: float = 0.0
+    cat_correct: int = 0
+    cat_total: int = 0
     n: int = 0
 
     def update(self, values: dict[str, float], batch_size: int) -> None:
@@ -49,15 +51,22 @@ class BatchStats:
         self.loss_reg += values["loss_reg"] * batch_size
         self.loss_cat += values["loss_cat"] * batch_size
         self.cat_acc += values["cat_acc"] * batch_size
+        self.cat_correct += int(values.get("_cat_correct", 0))
+        self.cat_total += int(values.get("_cat_total", 0))
         self.n += batch_size
 
     def averages(self) -> dict[str, float]:
         denom = max(self.n, 1)
+        cat_acc = (
+            self.cat_correct / self.cat_total
+            if self.cat_total
+            else self.cat_acc / denom
+        )
         return {
             "loss": self.loss / denom,
             "loss_reg": self.loss_reg / denom,
             "loss_cat": self.loss_cat / denom,
-            "cat_acc": self.cat_acc / denom,
+            "cat_acc": cat_acc,
         }
 
 
@@ -71,9 +80,18 @@ class GarmentDinoModel(nn.Module):
         dropout: float,
         freeze_backbone: bool,
         bounded_regression: bool = True,
+        dinov2_dir: str | Path | None = None,
     ) -> None:
         super().__init__()
-        self.backbone = torch.hub.load("facebookresearch/dinov2", backbone_name)
+        repo = Path(dinov2_dir).expanduser().resolve() if dinov2_dir else None
+        if repo is not None and (repo / "hubconf.py").is_file():
+            self.backbone = torch.hub.load(
+                str(repo), backbone_name, source="local", pretrained=True
+            )
+        else:
+            self.backbone = torch.hub.load(
+                "facebookresearch/dinov2", backbone_name, pretrained=True
+            )
         self.freeze_backbone = freeze_backbone
         self.bounded_regression = bounded_regression
         self.cat_vocab_sizes = cat_vocab_sizes
@@ -127,7 +145,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--prepared-dir", default="prepared_v2")
     parser.add_argument("--out-dir", default="runs/dinov2_vits14")
-    parser.add_argument("--backbone", default="dinov2_vitl14")
+    parser.add_argument("--backbone", default="dinov2_vitg14_reg")
+    parser.add_argument("--dinov2-dir")
     parser.add_argument("--mode", choices=("single", "all_images"), default="single")
     parser.add_argument("--augmentation", choices=("none", "light"), default="light")
     parser.add_argument("--image-size", type=int, default=224)
@@ -312,10 +331,20 @@ def compute_losses(
     batch: dict[str, Any],
     vocab_sizes: list[int],
     lambda_cat: float,
+    label_smoothing: float = 0.0,
+    class_weights: list[list[float] | None] | None = None,
+    reg_loss: str = "mse",
+    smooth_l1_beta: float = 0.05,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     y_reg = torch.cat([batch["y_cont"], batch["y_const"]], dim=-1)
     m_reg = torch.cat([batch["mask"], batch["const_mask"]], dim=-1)
-    loss_reg = ((pred_reg - y_reg).pow(2) * m_reg).sum() / m_reg.sum().clamp(min=1)
+    if reg_loss == "smooth_l1":
+        per_item_reg = F.smooth_l1_loss(
+            pred_reg, y_reg, reduction="none", beta=smooth_l1_beta
+        )
+    else:
+        per_item_reg = (pred_reg - y_reg).pow(2)
+    loss_reg = (per_item_reg * m_reg).sum() / m_reg.sum().clamp(min=1)
 
     loss_cat = pred_logits.new_zeros(())
     active_fields = 0
@@ -327,7 +356,18 @@ def compute_losses(
         target = batch["y_cat"][:, field_idx]
         valid = target.ne(-1)
         if valid.any():
-            loss_cat = loss_cat + F.cross_entropy(logits, target, ignore_index=-1)
+            weights = None
+            if class_weights is not None and class_weights[field_idx] is not None:
+                weights = torch.as_tensor(
+                    class_weights[field_idx], device=logits.device, dtype=logits.dtype
+                )
+            loss_cat = loss_cat + F.cross_entropy(
+                logits,
+                target,
+                ignore_index=-1,
+                label_smoothing=label_smoothing,
+                weight=weights,
+            )
             active_fields += 1
             pred = logits.argmax(dim=-1)
             correct += pred[valid].eq(target[valid]).sum().item()
@@ -343,9 +383,10 @@ def compute_losses(
         "loss_reg": float(loss_reg.detach().cpu()),
         "loss_cat": float(loss_cat.detach().cpu()),
         "cat_acc": correct / total if total else 0.0,
+        "_cat_correct": correct,
+        "_cat_total": total,
     }
     return loss, stats
-
 
 def run_epoch(
     model: GarmentDinoModel,
@@ -451,6 +492,7 @@ def main() -> None:
         dropout=args.dropout,
         freeze_backbone=not args.unfreeze_backbone,
         bounded_regression=args.bounded_regression,
+        dinov2_dir=args.dinov2_dir,
     ).to(device)
 
     optimizer = torch.optim.AdamW(

@@ -406,7 +406,124 @@ standalone decoder off `schema.json` alone, add the type lookup from `default.ya
 | file                     | role                                                      |
 | ------------------------ | --------------------------------------------------------- |
 | `prepare_data.py`        | data preparation pipeline and `GarmentDataset`            |
-| `dinov2_pipeline.py`     | train/infer entrypoint for baseline and model.py multihead |
+| prepare_garmentcode_smplx.py | ground-truth SMPL-X pose dataset preparer              |
+| `dinov2_pipeline.py`     | train/infer entrypoint for baseline, model.py, and grouped models |
 | `model.py`               | DINOv2 encoder plus per-parameter multihead MLP           |
 | `prediction_to_yaml.py`  | decode predictions into a GarmentCode design yaml         |
 | `render_garmentcode.py`  | render decoded GarmentCode outputs                        |
+
+
+### GarmentCodeSMPLX pose dataset
+
+The three training architectures now default to ground-truth samples in
+`/is/cluster/fast/pachar/Data/GarmentCodeSMPLX/train/samples`. Prepare completed
+folders, each containing `pose1`, `pose2`, `pose3`, and its matching JSON, with:
+
+```bash
+cd /is/cluster/pachar/Projects/ImageToGarment
+bash scripts/prepare_smplx_data.sh
+```
+
+This writes `/is/cluster/fast/pachar/Data/ImageToGarment/prepared_smplx`. Numeric
+labels remain raw in `targets.npz`; the models adapt their output ranges when a
+body-adjusted parameter exceeds the schema sampling range. No split sizes are
+chosen at image level. When no source validation folder exists, the preparer
+selects 10% of unique bodies using a deterministic stratified selector that
+balances garment count, garment categories, and active categorical labels.
+Bodies remain fully disjoint; set `VAL_FRACTION_OF_TRAIN_BODIES` to override
+the fraction. The decision and score components are saved in
+`split_selection.json`. The three poses become
+independent one-image items and are shuffled during training; the model input is
+still only one pose at a time.
+
+Submit the baseline, per-parameter multihead, or grouped three-MLP model:
+
+```bash
+bash runners/condor/submit_h100.sh smplx_baseline baseline 150
+bash runners/condor/submit_h100.sh smplx_multihead modelpy 150
+bash runners/condor/submit_h100.sh smplx_grouped grouped 150
+```
+
+### Grouped three-MLP model
+
+The `grouped` architecture uses the existing three semantic MLP heads: one each
+for upper-body, lower-body, and waistband parameters. Their outputs are packed
+back into the common prepared-data schema, so it uses the same targets,
+checkpoints, YAML conversion, rendering, and W&B metrics as the baseline.
+
+Submit it to an H100 with:
+
+```bash
+cd /is/cluster/pachar/Projects/ImageToGarment
+bash runners/condor/submit_h100.sh garment_grouped_vitl14 grouped 150
+```
+
+The Condor runner defaults to DINOv2 Large (`dinov2_vitl14`), a frozen encoder,
+light image augmentation, dropout, gradient clipping, LR reduction, early
+stopping, and checkpoints every 100 epochs. Override grouped widths with
+`HIDDEN_DIM` (shared trunk, default 512), `BRANCH_HIDDEN_DIM` (upper/lower,
+default 128), and `WAISTBAND_HIDDEN_DIM` (default 64).
+
+To visualise a grouped checkpoint over `GarmentImage` after it finishes:
+
+```bash
+cd /is/cluster/pachar/Projects/ImageToGarment
+CKPT=runs/<your_grouped_run>/best.pt
+venv/bin/python scripts/garmentimages_batch_infer.py \
+  --checkpoint "$CKPT" \
+  --architecture grouped \
+  --image-root /is/cluster/fast/pachar/Data/GarmentImage \
+  --out-dir runs/garmentimage_comparisons/grouped \
+  --device cuda \
+  --render-python venv/bin/python \
+  --garmentcode-dir GarmentCodeRC
+```
+
+The side-by-side front views are saved under
+`runs/garmentimage_comparisons/grouped/side_by_side`.
+
+
+## Train ChatGarment on GarmentCodeSMPLX
+
+The VLM converter scans `/is/cluster/fast/pachar/Data/GarmentCodeSMPLX`,
+keeps only garments with metadata, PKL, and all three readable pose images,
+and writes ChatGarment manifests with normalized sparse `[SEG]` float targets.
+Train and validation bodies must be disjoint.
+
+Prepare the currently complete samples:
+
+```bash
+cd /is/cluster/pachar/Projects/ImageToGarment
+bash scripts/prepare_chatgarment_smplx_vlm.sh
+cat /is/cluster/fast/pachar/Data/ChatGarmentSMPLXVLM/report.json
+```
+
+The command fails when the export has fewer than two train or validation bodies,
+has body overlap, or has no complete records. To inspect an incomplete export
+while rendering is still in progress:
+
+```bash
+bash scripts/prepare_chatgarment_smplx_vlm.sh --allow-incomplete
+```
+
+Once `report.json` contains `"ready": true`, make sure W&B is installed in the
+cluster venv, add your key once, and submit LLaVA-7B LoRA training:
+
+```bash
+./venv/bin/python -m pip install wandb
+cat > runners/condor/secrets.sh <<'EOF'
+export WANDB_API_KEY=your_wandb_key_here
+# export WANDB_ENTITY=your_team_or_username
+EOF
+chmod 600 runners/condor/secrets.sh
+bash runners/condor/submit_chatgarment_smplx_h100.sh smplx_vlm_lora 150
+```
+
+The job requests one 80 GB H100, 8 CPUs, 96 GB RAM, and 50 GB disk. It treats
+the three poses as independent examples, evaluates the fixed validation
+manifest after each epoch, and saves the latest DeepSpeed checkpoint under
+`runs/chatgarment_smplx/<run_name>/ckpt_model`. TensorBoard logs are in the
+same run directory, and W&B logs go to the `ImageToGarment` project by
+default. The main W&B curves are `train/loss`, `train/ce_loss`,
+`train/float_loss`, `val/loss`, `val/ce_loss`, `val/float_loss`, and
+`train/learning_rate`.

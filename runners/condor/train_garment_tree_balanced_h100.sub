@@ -1,0 +1,27 @@
+# Submit with runners/condor/submit_garment_tree_balanced_h100.sh.
+
+universe = vanilla
+initialdir = /is/cluster/pachar/Projects/ImageToGarment
+executable = /bin/bash
+arguments = runners/condor/run_train_garment_tree_balanced_h100.sh
+
+getenv = True
+should_transfer_files = NO
+
+LOG_PATH = runners/condor/logs/$(log_dir)/
+log = $(LOG_PATH)job.log
+output = $(LOG_PATH)job.out
+error = $(LOG_PATH)job.err
+
+request_gpus = 1
+request_cpus = 8
+request_memory = 64GB
+request_disk = 20GB
+
+# H100: compute capability 9.0 and at least 80 GB device memory.
+requirements = (TARGET.CUDACapability == 9.0 && TARGET.CUDAGlobalMemoryMb >= 80000 && UtsnameNodename =!= "i103" && UtsnameNodename =!= "g158" && UtsnameNodename =!= "g164" && UtsnameNodename =!= "g174")
+
+environment = "PROJECT_DIR=/is/cluster/pachar/Projects/ImageToGarment DATA_ROOT=/is/cluster/fast/pachar/Data PREPARED_DIR=/is/cluster/fast/pachar/Data/ImageToGarment/prepared_smplx_balanced OUT_DIR=/is/cluster/pachar/Projects/ImageToGarment/runs/$(log_dir)_garment_tree EPOCHS=400 MIN_EPOCHS=80 PATIENCE=60 BATCH_SIZE=24 NUM_WORKERS=8 IMAGE_SIZE=288 LR=3e-4 MIN_LR=3e-6 WEIGHT_DECAY=0.04"
+
+queue 1
+

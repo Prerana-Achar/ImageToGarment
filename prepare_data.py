@@ -650,6 +650,23 @@ def main():
 import torch  # noqa: E402  (kept below the CLI so `--help` needs no torch)
 
 
+class PadToSquare:
+    """Pad a portrait or landscape image to a square without stretching it."""
+
+    def __init__(self, fill=(255, 255, 255)):
+        self.fill = fill
+
+    def __call__(self, image):
+        from PIL import Image
+
+        side = max(image.width, image.height)
+        canvas = Image.new("RGB", (side, side), self.fill)
+        left = (side - image.width) // 2
+        top = (side - image.height) // 2
+        canvas.paste(image.convert("RGB"), (left, top))
+        return canvas
+
+
 class GarmentDataset(torch.utils.data.Dataset):
     """PyTorch dataset over a prepared split.
 
@@ -678,7 +695,8 @@ class GarmentDataset(torch.utils.data.Dataset):
     """
 
     def __init__(self, prepared_dir, split, mode="single", train=True,
-                 image_size=224, transform=None, augmentation="light"):
+                 image_size=224, transform=None, augmentation="light",
+                 aspect_pad=False):
         if mode not in ("single", "all_images"):
             raise ValueError(f"Unknown mode {mode!r}; expected 'single' or 'all_images'")
         self.prepared_dir = prepared_dir
@@ -727,15 +745,20 @@ class GarmentDataset(torch.utils.data.Dataset):
         self.image_samples = []
         self.refresh_samples()
 
-        if augmentation not in ("none", "light"):
-            raise ValueError(f"Unknown augmentation {augmentation!r}; expected 'none' or 'light'")
+        if augmentation not in ("none", "light", "domain"):
+            raise ValueError(
+                f"Unknown augmentation {augmentation!r}; "
+                "expected 'none', 'light', or 'domain'"
+            )
 
         if transform is None:
             from torchvision import transforms
+            square_prefix = [PadToSquare()] if aspect_pad else []
             if train and augmentation == "light":
                 # Keep geometry changes mild: garment labels can encode small
                 # shape details, and horizontal flips may change semantics.
                 self.transform = transforms.Compose([
+                    *square_prefix,
                     transforms.RandomResizedCrop(
                         image_size,
                         scale=(0.88, 1.0),
@@ -763,9 +786,49 @@ class GarmentDataset(torch.utils.data.Dataset):
                         value="random",
                     ),
                 ])
+            elif train and augmentation == "domain":
+                self.transform = transforms.Compose([
+                    *square_prefix,
+                    transforms.RandomAffine(
+                        degrees=7.0,
+                        translate=(0.05, 0.05),
+                        scale=(0.90, 1.08),
+                        interpolation=transforms.InterpolationMode.BICUBIC,
+                        fill=(255, 255, 255),
+                    ),
+                    transforms.Resize(
+                        (image_size, image_size),
+                        interpolation=transforms.InterpolationMode.BICUBIC,
+                    ),
+                    transforms.RandomApply([
+                        transforms.ColorJitter(
+                            brightness=0.35,
+                            contrast=0.30,
+                            saturation=0.25,
+                            hue=0.04,
+                        )
+                    ], p=0.9),
+                    transforms.RandomGrayscale(p=0.05),
+                    transforms.RandomApply([
+                        transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.5))
+                    ], p=0.15),
+                    transforms.ToTensor(),
+                    transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                         std=[0.229, 0.224, 0.225]),
+                    transforms.RandomErasing(
+                        p=0.20,
+                        scale=(0.02, 0.12),
+                        ratio=(0.4, 2.5),
+                        value="random",
+                    ),
+                ])
             else:
                 self.transform = transforms.Compose([
-                    transforms.Resize((image_size, image_size)),
+                    *square_prefix,
+                    transforms.Resize(
+                        (image_size, image_size),
+                        interpolation=transforms.InterpolationMode.BICUBIC,
+                    ),
                     transforms.ToTensor(),
                     transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                          std=[0.229, 0.224, 0.225]),

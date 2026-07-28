@@ -1,0 +1,26 @@
+# Submit through runners/condor/submit_person_garment_trellis_gnn_h100.sh.
+
+universe = vanilla
+initialdir = /is/cluster/pachar/Projects/ImageToGarment
+executable = /bin/bash
+arguments = runners/condor/run_person_garment_trellis_gnn_h100.sh
+
+getenv = True
+should_transfer_files = NO
+
+LOG_PATH = runners/condor/logs/$(log_dir)/
+log = $(LOG_PATH)job.log
+output = $(LOG_PATH)job.out
+error = $(LOG_PATH)job.err
+
+request_gpus = 1
+request_cpus = 16
+request_memory = 128GB
+request_disk = 120GB
+requirements = (TARGET.CUDACapability == 9.0 && TARGET.CUDAGlobalMemoryMb >= 80000 && UtsnameNodename =!= "i103" && UtsnameNodename =!= "g158" && UtsnameNodename =!= "g164" && UtsnameNodename =!= "g174")
+
++MaxRuntime = 43200
+
+environment = "PROJECT_DIR=/is/cluster/pachar/Projects/ImageToGarment VENV_DIR=/is/cluster/pachar/Projects/ImageToGarment/venv SETUP_ROOT=/is/cluster/fast/pachar/Data/ImageToGarment/trellis2_setup OUT_ROOT=/is/cluster/pachar/Projects/ImageToGarment/runs/person_garment_trellis_gnn LOG_DIR=$(log_dir) IMAGE_PATH=$(image_path) CHECKPOINT=$(checkpoint) GNN_EPOCHS=$(gnn_epochs) GNN_SURFACE_SAMPLES=$(gnn_surface_samples) MIN_ROOT_CONFIDENCE=$(min_root_confidence) MIN_ACTIVE_CATEGORICAL_CONFIDENCE=$(min_active_categorical_confidence) MIN_ACTIVE_NUMERIC_PROBABILITY=$(min_active_numeric_probability) MAX_ACTIVE_NUMERIC_UNCERTAINTY=$(max_active_numeric_uncertainty)"
+
+queue 1

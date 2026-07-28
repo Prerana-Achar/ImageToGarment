@@ -1,8 +1,8 @@
 #!/bin/bash
 
 if [ -z "$1" ]; then
-  echo "Usage: bash runners/condor/submit_h100.sh <run_name> [modelpy|baseline] [bid]"
-  echo "  e.g. bash runners/condor/submit_h100.sh garment_multihead modelpy"
+  echo "Usage: bash runners/condor/submit_h100.sh <run_name> [modelpy|baseline|grouped] [bid]"
+  echo "  e.g. bash runners/condor/submit_h100.sh garment_grouped grouped"
   exit 1
 fi
 
@@ -10,8 +10,8 @@ run_name="$1"
 architecture="${2:-modelpy}"
 bid="${3:-100}"
 
-if [ "${architecture}" != "modelpy" ] && [ "${architecture}" != "baseline" ]; then
-  echo "ERROR: architecture must be modelpy or baseline, got: ${architecture}" >&2
+if [ "${architecture}" != "modelpy" ] && [ "${architecture}" != "baseline" ] && [ "${architecture}" != "grouped" ]; then
+  echo "ERROR: architecture must be modelpy, baseline, or grouped, got: ${architecture}" >&2
   exit 2
 fi
 

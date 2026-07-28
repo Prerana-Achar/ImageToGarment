@@ -1,0 +1,18 @@
+universe = vanilla
+initialdir = /is/cluster/pachar/Projects/ImageToGarment
+executable = /bin/bash
+arguments = runners/condor/run_train_garment_ensemble_h100.sh
+getenv = True
+should_transfer_files = NO
+PROJECT_DIR = /is/cluster/pachar/Projects/ImageToGarment
+LOG_ROOT = $(PROJECT_DIR)/runners/condor/logs
+log = $(LOG_ROOT)/$(log_dir)/job.log
+output = $(LOG_ROOT)/$(log_dir)/job.out
+error = $(LOG_ROOT)/$(log_dir)/job.err
+request_gpus = 1
+request_cpus = 8
+request_memory = 128GB
+request_disk = 120GB
+requirements = (TARGET.CUDACapability == 9.0 && TARGET.CUDAGlobalMemoryMb >= 80000 && UtsnameNodename =!= "i103" && UtsnameNodename =!= "g158" && UtsnameNodename =!= "g164" && UtsnameNodename =!= "g174")
+environment = "PROJECT_DIR=/is/cluster/pachar/Projects/ImageToGarment DATA_ROOT=/is/cluster/fast/pachar/Data PREPARED_DIR=/is/cluster/fast/pachar/Data/ImageToGarment/prepared_smplx_output_balanced AUX_PREPARED_DIR=/is/cluster/fast/pachar/Data/ImageToGarment/prepared_chatgarment_full_current OUT_DIR=/is/cluster/pachar/Projects/ImageToGarment/runs/$(log_dir)_garment_tree_ensemble MEMBERS=5 FOLDS=5 OOF_EPOCHS=30 EPOCHS=180 SAMPLES_PER_GARMENT=4 ROOT_BALANCE_STRENGTH=1.0 BATCH_SIZE=48 NUM_WORKERS=8 IMAGE_SIZE=336 FEATURE_CACHE_AUGMENTATIONS=3 VALIDATION_EVERY=5 AUX_PRETRAIN_EPOCHS=15 AUX_BATCH_FRACTION=0.25 AUX_FEATURE_CACHE_AUGMENTATIONS=1 WANDB_PROJECT=ImageToGarment WANDB_ENTITY=draping WANDB_MODE=online BACKBONE_NAME=dinov2_vitb14"
+queue 1

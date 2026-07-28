@@ -1,0 +1,17 @@
+universe = vanilla
+initialdir = /is/cluster/pachar/Projects/ImageToGarment
+executable = /bin/bash
+arguments = runners/condor/run_infer_chatgarment_garmentimage_h100.sh
+getenv = True
+should_transfer_files = NO
+LOG_PATH = runners/condor/logs/$(log_dir)/
+log = $(LOG_PATH)job.log
+output = $(LOG_PATH)job.out
+error = $(LOG_PATH)job.err
+request_gpus = 1
+request_cpus = 8
+request_memory = 96GB
+request_disk = 80GB
+requirements = (TARGET.CUDACapability == 9.0 && TARGET.CUDAGlobalMemoryMb >= 80000 && UtsnameNodename =!= "i103" && UtsnameNodename =!= "g158" && UtsnameNodename =!= "g164" && UtsnameNodename =!= "g174")
+environment = "PROJECT_DIR=/is/cluster/pachar/Projects/ImageToGarment RUN_NAME=$(run_name) IMAGE_ROOT=$(image_root) RESULTS_DIR=/is/cluster/pachar/Projects/ImageToGarment/ChatGarment/ChatGarmentResults"
+queue 1

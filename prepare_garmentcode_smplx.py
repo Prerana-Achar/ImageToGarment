@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import itertools
 import json
 import math
 from collections import Counter, OrderedDict, defaultdict
@@ -65,12 +66,11 @@ def readable_png(path: Path) -> bool:
 
 
 def pick_views(folder: Path, name: str) -> list[str] | None:
-    textured = [folder / f"{name}_render_{view}_textured.png" for view in ("front", "back")]
-    plain = [folder / f"{name}_render_{view}.png" for view in ("front", "back")]
-    selected = textured if all(readable_png(path) for path in textured) else plain
-    if not all(readable_png(path) for path in selected):
+    """Return three independent one-pose inputs for this garment."""
+    poses = [folder / f"{name}_pose{index}.png" for index in (1, 2, 3)]
+    if not all(readable_png(path) for path in poses):
         return None
-    return [str(path.resolve()) for path in selected]
+    return [str(path.resolve()) for path in poses]
 
 
 def design_hash(meta: dict[str, Any]) -> str:
@@ -91,6 +91,12 @@ def scan(root: Path, specs: OrderedDict[str, dict[str, Any]]):
             name = folder.name
             meta_path = folder / f"{name}.json"
             pkl_path = folder / f"{name}.pkl"
+            try:
+                garment_pkl_present = (
+                    pkl_path.is_file() and pkl_path.stat().st_size > 0
+                )
+            except OSError:
+                garment_pkl_present = False
             reason = None
             try:
                 meta = json.loads(meta_path.read_text())
@@ -100,8 +106,7 @@ def scan(root: Path, specs: OrderedDict[str, dict[str, Any]]):
             if meta is not None:
                 if meta.get("design_target_version") != TARGET_VERSION:
                     reason = "legacy sample: missing design_target_version=1"
-                elif not pkl_path.is_file() or pkl_path.stat().st_size == 0:
-                    reason = "missing garment pkl"
+
                 elif set(meta.get("design_values") or {}) != expected:
                     missing = sorted(expected - set(meta.get("design_values") or {}))
                     extra = sorted(set(meta.get("design_values") or {}) - expected)
@@ -112,7 +117,7 @@ def scan(root: Path, specs: OrderedDict[str, dict[str, Any]]):
                     reason = f"unknown category {meta.get('category')!r}"
             views = pick_views(folder, name) if reason is None else None
             if reason is None and views is None:
-                reason = "missing/corrupt front or back render"
+                reason = "missing/corrupt pose1, pose2, or pose3 image"
             if reason is not None:
                 rejected.append({"split": source_split, "folder": str(folder), "reason": reason})
                 continue
@@ -120,31 +125,197 @@ def scan(root: Path, specs: OrderedDict[str, dict[str, Any]]):
                 "gid": f"{source_split}:{name}", "name": name,
                 "source_split": source_split, "folder": folder, "meta": meta,
                 "views": views, "design_hash": design_hash(meta),
+                "optional_artifacts": {
+                    "garment_pkl_present": garment_pkl_present,
+                    "garment_pkl_path": str(pkl_path),
+                },
             })
     return records, rejected
 
 
-def split_by_body(records: list[dict[str, Any]], test_fraction: float, seed: int):
+def _select_validation_bodies(
+    train_records: list[dict[str, Any]],
+    val_fraction: float,
+    specs: OrderedDict[str, dict[str, Any]],
+    seed: int,
+) -> tuple[set[str], dict[str, Any]]:
+    """Choose a representative validation subset while keeping bodies intact."""
+    by_body: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for record in train_records:
+        by_body[record["meta"]["body_name"]].append(record)
+    bodies = sorted(by_body)
+    if len(bodies) < 2 or val_fraction <= 0:
+        return set(), {
+            "mode": "disabled", "selected_bodies": [], "seed": seed,
+            "val_fraction": val_fraction, "candidate_subsets_evaluated": 0,
+        }
+
+    n_val = min(max(int(round(len(bodies) * val_fraction)), 1), len(bodies) - 1)
+    categorical_paths = {
+        path for path, spec in specs.items()
+        if spec["type"] in ("bool", "select", "select_null")
+    }
+    profiles = {}
+    global_categories: Counter[str] = Counter()
+    global_fields: dict[str, Counter[str]] = defaultdict(Counter)
+    for body, body_records in by_body.items():
+        categories: Counter[str] = Counter()
+        fields: dict[str, Counter[str]] = defaultdict(Counter)
+        for record in body_records:
+            meta = record["meta"]
+            categories[meta["category"]] += 1
+            for path in set(meta["design_active_paths"]) & categorical_paths:
+                fields[path][value_key(meta["design_values"][path])] += 1
+        profiles[body] = {"samples": len(body_records), "categories": categories, "fields": fields}
+        global_categories.update(categories)
+        for path, counts in fields.items():
+            global_fields[path].update(counts)
+
+    target_samples = len(train_records) * val_fraction
+    evaluated = 0
+
+    def score(candidate: tuple[str, ...]):
+        nonlocal evaluated
+        evaluated += 1
+        samples = sum(profiles[body]["samples"] for body in candidate)
+        categories: Counter[str] = Counter()
+        fields: dict[str, Counter[str]] = defaultdict(Counter)
+        for body in candidate:
+            categories.update(profiles[body]["categories"])
+            for path, counts in profiles[body]["fields"].items():
+                fields[path].update(counts)
+
+        sample_error = abs(samples - target_samples) / max(target_samples, 1.0)
+        category_tv = 0.5 * sum(
+            abs(categories[name] / max(samples, 1)
+                - global_categories[name] / len(train_records))
+            for name in global_categories
+        )
+        missing_fraction = (
+            sum(categories[name] == 0 for name in global_categories)
+            / max(len(global_categories), 1)
+        )
+        field_tvs = []
+        for path, global_counts in global_fields.items():
+            selected_counts = fields[path]
+            selected_total = sum(selected_counts.values())
+            global_total = sum(global_counts.values())
+            if selected_total == 0:
+                field_tvs.append(1.0)
+            else:
+                field_tvs.append(0.5 * sum(
+                    abs(selected_counts[label] / selected_total
+                        - global_counts[label] / global_total)
+                    for label in global_counts
+                ))
+        categorical_tv = float(np.mean(field_tvs)) if field_tvs else 0.0
+        components = {
+            "sample_relative_error": float(sample_error),
+            "garment_category_tv": float(category_tv),
+            "missing_garment_category_fraction": float(missing_fraction),
+            "categorical_label_tv": categorical_tv,
+            "selected_samples": samples,
+            "target_samples": float(target_samples),
+        }
+        total = sample_error + 2.0 * category_tv + 0.5 * missing_fraction + categorical_tv
+        return (round(float(total), 12), candidate), float(total), components
+
+    combination_count = math.comb(len(bodies), n_val)
+    if combination_count <= 200_000:
+        mode = "exact_stratified_body_holdout"
+        best = min(
+            (score(candidate) for candidate in itertools.combinations(bodies, n_val)),
+            key=lambda result: result[0],
+        )
+        _, best_score, components = best
+        selected = best[0][1]
+    else:
+        mode = "greedy_stratified_body_holdout"
+        selected: tuple[str, ...] = ()
+        while len(selected) < n_val:
+            best = min(
+                (score(tuple(sorted((*selected, body))))
+                 for body in bodies if body not in selected),
+                key=lambda result: result[0],
+            )
+            selected = best[0][1]
+        improved = True
+        while improved:
+            improved = False
+            current = score(selected)
+            for old_body in selected:
+                for new_body in bodies:
+                    if new_body in selected:
+                        continue
+                    candidate = tuple(sorted((set(selected) - {old_body}) | {new_body}))
+                    replacement = score(candidate)
+                    if replacement[0] < current[0]:
+                        selected, current, improved = candidate, replacement, True
+                        break
+                if improved:
+                    break
+        _, best_score, components = current
+
+    return set(selected), {
+        "mode": mode, "selected_bodies": list(selected), "seed": seed,
+        "val_fraction": val_fraction, "body_count": len(bodies),
+        "selected_body_count": n_val, "candidate_subsets_total": combination_count,
+        "candidate_subsets_evaluated": evaluated, "score": best_score,
+        "score_weights": {
+            "sample_relative_error": 1.0, "garment_category_tv": 2.0,
+            "missing_garment_category_fraction": 0.5, "categorical_label_tv": 1.0,
+        },
+        "components": components,
+    }
+
+
+def split_by_body(
+    records: list[dict[str, Any]],
+    val_fraction: float,
+    test_fraction: float | None,
+    seed: int,
+    specs: OrderedDict[str, dict[str, Any]],
+):
+    """Create deterministic body-disjoint splits with a stratified holdout."""
     assigned: dict[str, list[str]] = {"train": [], "val": [], "test": []}
-    val_bodies = sorted({r["meta"]["body_name"] for r in records if r["source_split"] == "val"})
     rng = np.random.default_rng(seed)
-    rng.shuffle(val_bodies)
-    n_test = int(round(len(val_bodies) * test_fraction))
-    if len(val_bodies) >= 2 and test_fraction > 0:
-        n_test = min(max(n_test, 1), len(val_bodies) - 1)
-    test_bodies = set(val_bodies[:n_test])
+    source_val_bodies = sorted({
+        record["meta"]["body_name"] for record in records
+        if record["source_split"] == "val"
+    })
+    if source_val_bodies:
+        validation_bodies = set()
+        selection_info = {
+            "mode": "source_validation", "selected_bodies": source_val_bodies,
+            "seed": seed, "val_fraction": None, "candidate_subsets_evaluated": 0,
+        }
+    else:
+        validation_bodies, selection_info = _select_validation_bodies(
+            [record for record in records if record["source_split"] == "train"],
+            val_fraction, specs, seed,
+        )
+
+    test_bodies: set[str] = set()
+    if test_fraction is not None:
+        candidate_bodies = source_val_bodies.copy()
+        rng.shuffle(candidate_bodies)
+        n_test = int(round(len(candidate_bodies) * test_fraction))
+        if len(candidate_bodies) >= 2 and test_fraction > 0:
+            n_test = min(max(n_test, 1), len(candidate_bodies) - 1)
+        test_bodies = set(candidate_bodies[:n_test])
+
     for record in records:
         source = record["source_split"]
+        body_name = record["meta"]["body_name"]
         if source == "train":
-            split = "train"
-        elif source == "test" or record["meta"]["body_name"] in test_bodies:
+            split = "val" if body_name in validation_bodies else "train"
+        elif source == "test" or body_name in test_bodies:
             split = "test"
         else:
             split = "val"
         record["split"] = split
         assigned[split].append(record["gid"])
-    return {key: sorted(value) for key, value in assigned.items()}
-
+    return ({key: sorted(value) for key, value in assigned.items()}, selection_info)
 
 def build_arrays(records: list[dict[str, Any]], specs: OrderedDict[str, dict[str, Any]]):
     active_any = {path for record in records for path in record["meta"]["design_active_paths"]}
@@ -165,31 +336,45 @@ def build_arrays(records: list[dict[str, Any]], specs: OrderedDict[str, dict[str
         if not cat_vocab[path]:
             raise RuntimeError(f"No observed class for active categorical path {path}")
 
-    cont_slots = OrderedDict((path, index) for index, path in enumerate(regression))
+    # Preserve raw numeric ground truth. GarmentDataset normalizes const slots,
+    # and the model.py adapter expands its sigmoid output range when observed
+    # body-adjusted values exceed the schema's sampling range.
+    const_slots = OrderedDict((path, index) for index, path in enumerate(regression))
+    const_ranges = OrderedDict()
+    for path in regression:
+        observed_values = [
+            float(record["meta"]["design_values"][path])
+            for record in records
+            if path in record["meta"]["design_active_paths"]
+        ]
+        schema_lo, schema_hi = map(float, specs[path]["range"])
+        const_ranges[path] = [
+            min([schema_lo, *observed_values]),
+            max([schema_hi, *observed_values]),
+        ]
+
     cat_paths = list(cat_vocab)
     gids = [record["gid"] for record in records]
-    y_cont = np.zeros((len(records), len(regression)), dtype=np.float32)
+    y_cont = np.zeros((len(records), 0), dtype=np.float32)
     mask = np.zeros_like(y_cont)
-    y_const = np.zeros((len(records), 0), dtype=np.float32)
+    y_const = np.zeros((len(records), len(regression)), dtype=np.float32)
     const_mask = np.zeros_like(y_const)
     y_cat = np.full((len(records), len(categorical)), -1, dtype=np.int64)
     for row, record in enumerate(records):
         values = record["meta"]["design_values"]
         active = set(record["meta"]["design_active_paths"])
-        for path, col in cont_slots.items():
+        for path, col in const_slots.items():
             if path not in active:
                 continue
-            lo, hi = map(float, specs[path]["range"])
-            raw = float(values[path])
-            y_cont[row, col] = np.clip((raw - lo) / max(hi - lo, 1e-8), 0.0, 1.0)
-            mask[row, col] = 1.0
+            y_const[row, col] = float(values[path])
+            const_mask[row, col] = 1.0
         for col, path in enumerate(cat_paths):
             if path in active:
                 y_cat[row, col] = next(i for i, value in enumerate(cat_vocab[path])
                                             if value_key(value) == value_key(values[path]))
     schema = {
-        "n_cont": len(regression), "n_const": 0, "n_cat": len(categorical),
-        "cont_slots": cont_slots, "const_slots": {}, "const_ranges": {},
+        "n_cont": 0, "n_const": len(regression), "n_cat": len(categorical),
+        "cont_slots": {}, "const_slots": const_slots, "const_ranges": const_ranges,
         "cat_vocab": cat_vocab,
         "target_contract": "GarmentCodeSMPLX/design_target_version=1",
         "inactive_target_semantics": "mask=0 and y_cat=-1",
@@ -222,10 +407,10 @@ def balance_report(records, rejected, splits, specs, schema, strict_spread):
             tolerance = max(strict_spread, int(math.ceil(0.10 * mean_count)))
             if split == "train" and path not in TOPOLOGY_CONTROLLED and spread > tolerance:
                 free_failures.append({"path": path, "spread": spread, "tolerance": tolerance, "counts": ordered})
-        for path in schema["cont_slots"]:
+        for path in schema["const_slots"]:
             vals = [float(by_gid[gid]["meta"]["design_values"][path]) for gid in gids
                     if path in by_gid[gid]["meta"]["design_active_paths"]]
-            lo, hi = map(float, specs[path]["range"])
+            lo, hi = map(float, schema["const_ranges"][path])
             hist = np.histogram(vals, bins=10, range=(lo, hi))[0].tolist() if vals else [0] * 10
             reg_counts[path] = {"active": len(vals), "min": min(vals) if vals else None,
                                 "max": max(vals) if vals else None, "histogram_10": hist}
@@ -249,7 +434,10 @@ def balance_report(records, rejected, splits, specs, schema, strict_spread):
         vals = list(split_report[split]["category_counts"].values())
         if not vals or min(vals) == 0 or max(vals) - min(vals) > 1:
             category_failures.append({"split": split, "counts": split_report[split]["category_counts"]})
-    unsupported = sorted(set(specs) - set(schema["cont_slots"]) - set(schema["cat_vocab"]))
+    unsupported = sorted(
+        set(specs) - set(schema["cont_slots"]) - set(schema["const_slots"])
+        - set(schema["cat_vocab"])
+    )
     unobserved_choices = {
         path: [value for value in choices(specs[path]) if value not in vocab]
         for path, vocab in schema["cat_vocab"].items()
@@ -276,12 +464,27 @@ def main() -> None:
     parser.add_argument("--dataset-root", required=True)
     parser.add_argument("--out", required=True)
     parser.add_argument("--schema", default=str(Path(__file__).resolve().parent / "GarmentCodeRC/assets/design_params/default_new.yaml"))
-    parser.add_argument("--test-fraction-of-val-bodies", type=float, default=0.5)
+    parser.add_argument(
+        "--val-fraction-of-train-bodies",
+        type=float,
+        default=0.1,
+        help="body-level validation holdout used only when no source val samples exist",
+    )
+    parser.add_argument(
+        "--test-fraction-of-val-bodies",
+        type=float,
+        help="optional explicit fraction of validation bodies to move to test; omitted preserves source splits",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--strict-categorical-spread", type=int, default=1)
     parser.add_argument("--allow-incomplete", action="store_true")
     args = parser.parse_args()
-    if not 0 <= args.test_fraction_of_val_bodies < 1:
+    if not 0 < args.val_fraction_of_train_bodies < 1:
+        parser.error("--val-fraction-of-train-bodies must be in (0,1)")
+    if (
+        args.test_fraction_of_val_bodies is not None
+        and not 0 <= args.test_fraction_of_val_bodies < 1
+    ):
         parser.error("--test-fraction-of-val-bodies must be in [0,1)")
     root = Path(args.dataset_root).expanduser().resolve()
     out = Path(args.out).expanduser().resolve()
@@ -290,7 +493,13 @@ def main() -> None:
     records, rejected = scan(root, specs)
     if not records:
         raise RuntimeError(f"No version-{TARGET_VERSION} training-ready samples found under {root}")
-    splits = split_by_body(records, args.test_fraction_of_val_bodies, args.seed)
+    splits, split_selection = split_by_body(
+        records,
+        args.val_fraction_of_train_bodies,
+        args.test_fraction_of_val_bodies,
+        args.seed,
+        specs,
+    )
     schema, arrays = build_arrays(records, specs)
     images = {record["gid"]: {"meta": [record["meta"]["design_values"].get(f"meta.{key}")
                                              for key in ("upper", "wb", "bottom")],
@@ -301,6 +510,7 @@ def main() -> None:
     (out / "schema.json").write_text(json.dumps(schema, indent=2))
     (out / "images.json").write_text(json.dumps(images, indent=2))
     (out / "splits.json").write_text(json.dumps(splits, indent=2))
+    (out / "split_selection.json").write_text(json.dumps(split_selection, indent=2))
     (out / "balance_report.json").write_text(json.dumps(report, indent=2))
     np.savez_compressed(out / "targets.npz", **arrays)
     print(f"Prepared {len(records)} samples -> {out}")

@@ -1,18 +1,19 @@
 #!/bin/bash
 
-# Condor payload for training either DINOv2 baseline or model.py multihead.
+# Condor payload for DINOv2 baseline, model.py multihead, or grouped three-MLP training.
 # This script is intentionally small: all heavy lifting stays in
 # dinov2_pipeline.py.
 
 PROJECT_DIR="${PROJECT_DIR:-/is/cluster/pachar/Projects/ImageToGarment}"
 DATA_ROOT="${DATA_ROOT:-/is/cluster/fast/pachar/Data}"
-PREPARED_DIR="${PREPARED_DIR:-${DATA_ROOT}/ImageToGarment/prepared_all}"
+PREPARED_DIR="${PREPARED_DIR:-${DATA_ROOT}/ImageToGarment/prepared_smplx}"
 RUN_ROOT="${RUN_ROOT:-${PROJECT_DIR}/runs}"
 VENV="${VENV:-${PROJECT_DIR}/venv}"
 ARCHITECTURE="${ARCHITECTURE:-modelpy}"
 BACKBONE="${BACKBONE:-dinov2_vitl14}"
 MODE="${MODE:-all_images}"
 AUGMENTATION="${AUGMENTATION:-light}"
+ALLOW_UNBALANCED_DATA="${ALLOW_UNBALANCED_DATA:-1}"
 EPOCHS="${EPOCHS:-1000}"
 SAVE_EVERY="${SAVE_EVERY:-100}"
 BATCH_SIZE="${BATCH_SIZE:-64}"
@@ -23,6 +24,8 @@ LAMBDA_CAT="${LAMBDA_CAT:-1.0}"
 DROPOUT="${DROPOUT:-0.4}"
 HEAD_HIDDEN_DIMS="${HEAD_HIDDEN_DIMS:-64 32}"
 HEAD_LAYER_NORM="${HEAD_LAYER_NORM:-1}"
+BRANCH_HIDDEN_DIM="${BRANCH_HIDDEN_DIM:-128}"
+WAISTBAND_HIDDEN_DIM="${WAISTBAND_HIDDEN_DIM:-64}"
 LABEL_SMOOTHING="${LABEL_SMOOTHING:-0.05}"
 CLASS_WEIGHTING="${CLASS_WEIGHTING:-effective}"
 CLASS_WEIGHT_BETA="${CLASS_WEIGHT_BETA:-0.999}"
@@ -35,7 +38,7 @@ LR_PLATEAU_FACTOR="${LR_PLATEAU_FACTOR:-0.5}"
 MIN_LR="${MIN_LR:-1e-6}"
 EARLY_STOPPING_PATIENCE="${EARLY_STOPPING_PATIENCE:-20}"
 MIN_DELTA="${MIN_DELTA:-5e-4}"
-SHARED_HIDDEN_DIM="${SHARED_HIDDEN_DIM:-}"
+SHARED_HIDDEN_DIM="${SHARED_HIDDEN_DIM:-256}"
 MODEL_SCHEMA="${MODEL_SCHEMA:-${PROJECT_DIR}/GarmentCodeRC/assets/design_params/default_new.yaml}"
 DINOV2_DIR="${DINOV2_DIR:-${PROJECT_DIR}/DINOv2}"
 OUT_DIR="${OUT_DIR:-${RUN_ROOT}/${ARCHITECTURE}_${BACKBONE}_h100}"
@@ -88,7 +91,7 @@ fi
 
 if [ ! -f "${PREPARED_DIR}/schema.json" ]; then
   echo "ERROR: prepared data missing at ${PREPARED_DIR}" >&2
-  echo "Run: bash scripts/fetch_all_fast_data.sh" >&2
+  echo "Run: bash scripts/prepare_smplx_data.sh" >&2
   exit 3
 fi
 
@@ -137,6 +140,12 @@ REGULARIZATION_ARGS=(
 if [ "${HEAD_LAYER_NORM}" = "1" ]; then
   REGULARIZATION_ARGS+=(--head-layer-norm)
 fi
+READINESS_ARGS=()
+if [ "${ALLOW_UNBALANCED_DATA}" = "1" ]; then
+  REGULARIZATION_ARGS+=(--allow-unbalanced-data)
+  READINESS_ARGS+=(--allow-unbalanced-data)
+  echo "WARNING: training readiness gate overridden; using currently complete samples"
+fi
 
 nvidia-smi || true
 python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda, 'available', torch.cuda.is_available())"
@@ -157,6 +166,35 @@ if [ "${ARCHITECTURE}" = "baseline" ]; then
     --lambda-cat "${LAMBDA_CAT}" \
     --dropout "${DROPOUT}" \
     "${REGULARIZATION_ARGS[@]}" \
+    --device cuda \
+    --amp \
+    "${WANDB_ARGS[@]}"
+elif [ "${ARCHITECTURE}" = "grouped" ]; then
+  python -u "${PROJECT_DIR}/dinov2_pipeline.py" train \
+    --architecture grouped \
+    --prepared-dir "${PREPARED_DIR}" \
+    --out-dir "${OUT_DIR}" \
+    --backbone "${BACKBONE}" \
+    --mode "${MODE}" \
+    --epochs "${EPOCHS}" \
+    --save-every "${SAVE_EVERY}" \
+    --batch-size "${BATCH_SIZE}" \
+    --num-workers "${NUM_WORKERS}" \
+    --lr "${LR}" \
+    --weight-decay "${WEIGHT_DECAY}" \
+    --lambda-cat "${LAMBDA_CAT}" \
+    --dropout "${DROPOUT}" \
+    --hidden-dim "${HIDDEN_DIM:-512}" \
+    --branch-hidden-dim "${BRANCH_HIDDEN_DIM}" \
+    --waistband-hidden-dim "${WAISTBAND_HIDDEN_DIM}" \
+    --augmentation "${AUGMENTATION}" \
+    --grad-clip-norm "${GRAD_CLIP_NORM}" \
+    --lr-plateau-patience "${LR_PLATEAU_PATIENCE}" \
+    --lr-plateau-factor "${LR_PLATEAU_FACTOR}" \
+    --min-lr "${MIN_LR}" \
+    --early-stopping-patience "${EARLY_STOPPING_PATIENCE}" \
+    --min-delta "${MIN_DELTA}" \
+    "${READINESS_ARGS[@]}" \
     --device cuda \
     --amp \
     "${WANDB_ARGS[@]}"
@@ -208,6 +246,6 @@ elif [ "${ARCHITECTURE}" = "modelpy" ]; then
       "${WANDB_ARGS[@]}"
   fi
 else
-  echo "ERROR: ARCHITECTURE must be baseline or modelpy, got ${ARCHITECTURE}" >&2
+  echo "ERROR: ARCHITECTURE must be baseline, modelpy, or grouped, got ${ARCHITECTURE}" >&2
   exit 2
 fi

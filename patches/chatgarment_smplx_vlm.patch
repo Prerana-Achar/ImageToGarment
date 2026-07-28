@@ -1,0 +1,363 @@
+diff --git a/llava/model/language_model/llava_garment_float50.py b/llava/model/language_model/llava_garment_float50.py
+index b83eb97..f48d72a 100644
+--- a/llava/model/language_model/llava_garment_float50.py
++++ b/llava/model/language_model/llava_garment_float50.py
+@@ -148,7 +148,8 @@ def forward(
+                 if float_weight is not None:
+                     float_weight = torch.cat(float_weight, dim=0).type(text_embeddings.dtype)
+                     assert hmr_loss.shape == float_weight.reshape(-1, self.last_dim).shape, (hmr_loss.shape, float_weight.shape)
+-                    hmr_loss = (hmr_loss * float_weight.reshape(-1, self.last_dim)).mean()
++                    float_weight = float_weight.reshape(-1, self.last_dim)
++                    hmr_loss = (hmr_loss * float_weight).sum() / float_weight.sum().clamp_min(1.0)
+                 else:
+                     hmr_loss = hmr_loss.mean()
+                     raise NotImplementedError   
+diff --git a/llava/train/train_garmentcode_outfit.py b/llava/train/train_garmentcode_outfit.py
+index 77f5ce1..85611bc 100644
+--- a/llava/train/train_garmentcode_outfit.py
++++ b/llava/train/train_garmentcode_outfit.py
+@@ -20,6 +20,7 @@
+ import json
+ import logging
+ import pathlib
++import math
+ from typing import Dict, Optional, Sequence, List
+ import shutil
+ 
+@@ -601,11 +602,17 @@ def __init__(self, data_path: str,
+                  data_args: DataArguments,
+                  max_len=-1,
+                  random_imgaug=False,
+-                 has_sewing_pattern=False):
++                 has_sewing_pattern=False,
++                 sample_randomly=True,
++                 augment_prompt=True):
+         super(LazySupervisedDataset, self).__init__()
+         # print('LazySupervisedDataset', LazySupervisedDataset, data_path)
+         list_data_dict = json.load(open(data_path, "r"))
++        if not list_data_dict:
++            raise ValueError(f"Dataset is empty: {data_path}")
+         self.has_sewing_pattern = has_sewing_pattern
++        self.sample_randomly = sample_randomly
++        self.augment_prompt = augment_prompt
+ 
+         if max_len > 0:
+             list_data_dict = list_data_dict[:max_len]
+@@ -664,17 +671,31 @@ def modality_lengths(self):
+         return length_list
+ 
+     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
+-        i = bisect.bisect_left(self.cumsum, random.random())
++        if self.sample_randomly:
++            i = min(bisect.bisect_left(self.cumsum, random.random()), len(self) - 1)
+         sources = copy.deepcopy(self.list_data_dict[i])
+ 
+         ################ prompt augmentation ################
+         prompt = sources["conversations"][0]["value"]
+-        prompt = change_prompt(prompt[:])
+-        sources["conversations"][0]["value"] = prompt
++        if self.augment_prompt:
++            prompt = change_prompt(prompt[:])
++            sources["conversations"][0]["value"] = prompt
+ 
+         if self.has_sewing_pattern:
+             answer = sources["conversations"][1]["value"]
+-            answer, indices = change_answer(answer[:], self.all_float_paths_dict, True)
++            if self.augment_prompt:
++                answer, indices = change_answer(
++                    answer[:], self.all_float_paths_dict, True
++                )
++            else:
++                random_state = random.getstate()
++                try:
++                    random.seed(i)
++                    answer, indices = change_answer(
++                        answer[:], self.all_float_paths_dict, True
++                    )
++                finally:
++                    random.setstate(random_state)
+             sources["conversations"][1]["value"] = answer
+ 
+         ################ add trivial image if no image ################
+@@ -702,7 +723,7 @@ def __getitem__(self, i) -> Dict[str, torch.Tensor]:
+             image = convert_rgba_to_rgb_with_white_bg(os.path.join(image_folder, image_file))
+             if self.random_imgaug and rand_flag:
+                 image = autocrop(image)
+-            elif rand_flag:
++            elif rand_flag and self.augment_prompt:
+                 image = autocrop(image, matrix_HW_pct_range=[0.8, 0.96])
+ 
+             if self.data_args.image_aspect_ratio == 'pad':
+@@ -856,24 +877,84 @@ def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
+ 
+ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
+                                 data_args, data_path_list) -> Dict:
+-    """Make dataset and collator for supervised fine-tuning."""
+-    train_dataset = LazySupervisedDatasetCmb(tokenizer=tokenizer,
+-                                data_path_list=data_path_list,
+-                                data_args=data_args)
+-    
+-    eval_dataset = LazySupervisedDataset(tokenizer=tokenizer,
+-                                data_path=data_args.data_path_eval,
+-                                data_args=data_args,
+-                                max_len=10)
++    """Make datasets and collator for supervised fine-tuning."""
++    if data_args.data_path and os.path.isfile(data_args.data_path):
++        train_dataset = LazySupervisedDataset(
++            tokenizer=tokenizer,
++            data_path=data_args.data_path,
++            data_args=data_args,
++            random_imgaug=True,
++            has_sewing_pattern=True,
++            sample_randomly=True,
++            augment_prompt=True,
++        )
++    else:
++        train_dataset = LazySupervisedDatasetCmb(
++            tokenizer=tokenizer,
++            data_path_list=data_path_list,
++            data_args=data_args,
++        )
+ 
+-    data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
++    if not data_args.data_path_eval or not os.path.isfile(data_args.data_path_eval):
++        raise FileNotFoundError(
++            f"Validation manifest does not exist: {data_args.data_path_eval}"
++        )
++    eval_dataset = LazySupervisedDataset(
++        tokenizer=tokenizer,
++        data_path=data_args.data_path_eval,
++        data_args=data_args,
++        random_imgaug=False,
++        has_sewing_pattern=True,
++        sample_randomly=False,
++        augment_prompt=False,
++    )
+ 
++    data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
+     return train_dataset, eval_dataset, data_collator
+ 
+ 
+ 
++@torch.inference_mode()
+ def validate_epoch(val_loader, model_engine, tokenizer, epoch, writer, args):
+-    return
++    losses = AverageMeter("ValLoss", ":.4f")
++    ce_losses = AverageMeter("ValCeLoss", ":.4f")
++    hmr_losses = AverageMeter("ValHMRLoss", ":.4f")
++    model_engine.eval()
++
++    for input_dict in val_loader:
++        input_dict = dict_to_cuda(input_dict)
++        input_dict["images"] = input_dict["images"].bfloat16()
++        input_dict.pop("image_paths", None)
++        output_dict = model_engine(**input_dict)
++        batch_size = input_dict["images"].size(0)
++        losses.update(output_dict["loss"].item(), batch_size)
++        ce_losses.update(output_dict["ce_loss"].item(), batch_size)
++        hmr_losses.update(output_dict["hmr_loss"].item(), batch_size)
++
++    if args.distributed:
++        losses.all_reduce()
++        ce_losses.all_reduce()
++        hmr_losses.all_reduce()
++    if args.local_rank == 0:
++        writer.add_scalar("val/loss", losses.avg, epoch + 1)
++        writer.add_scalar("val/ce_loss", ce_losses.avg, epoch + 1)
++        writer.add_scalar("val/hmr_loss", hmr_losses.avg, epoch + 1)
++        if args.wandb_run is not None:
++            args.wandb_run.log(
++                {
++                    "val/loss": losses.avg,
++                    "val/ce_loss": ce_losses.avg,
++                    "val/float_loss": hmr_losses.avg,
++                    "epoch": epoch + 1,
++                },
++                step=max(0, (epoch + 1) * args.steps_per_epoch - 1),
++            )
++        print(
++            f"Validation epoch {epoch + 1}: loss={losses.avg:.4f}, "
++            f"ce={ce_losses.avg:.4f}, hmr={hmr_losses.avg:.4f}"
++        )
++    model_engine.train()
++    return losses.avg
+ 
+ 
+ 
+@@ -967,6 +1048,19 @@ def train_epoch(
+                 writer.add_scalar(
+                     "metrics/data_secs_per_batch", data_time.avg, global_step_actual
+                 )
++                if args.wandb_run is not None:
++                    args.wandb_run.log(
++                        {
++                            "train/loss": losses.avg,
++                            "train/ce_loss": ce_losses.avg,
++                            "train/float_loss": hmr_losses.avg,
++                            "train/learning_rate": scheduler.get_last_lr()[0],
++                            "train/data_seconds": data_time.avg,
++                            "train/batch_seconds": batch_time.avg,
++                            "epoch": epoch + (global_step + 1) / args.steps_per_epoch,
++                        },
++                        step=global_step_actual,
++                    )
+ 
+             batch_time.reset()
+             data_time.reset()
+@@ -1002,13 +1096,14 @@ def translate_args(model_args, data_args, training_args):
+         sample_rates=None,
+         log_base_dir='./runs',
+         exp_name="chatgarment_train_scratch",
+-        epochs=40,
+-        steps_per_epoch=500,
+-        batch_size=4,
+-        grad_accumulation_steps=8,
+-        val_batch_size=1,
+-        workers=8,
+-        lr=1e-4,
++        epochs=int(training_args.num_train_epochs),
++        steps_per_epoch=1,
++        batch_size=training_args.per_device_train_batch_size,
++        grad_accumulation_steps=training_args.gradient_accumulation_steps,
++        val_batch_size=training_args.per_device_eval_batch_size,
++        workers=training_args.dataloader_num_workers,
++        lr=training_args.learning_rate,
++        weight_decay=training_args.weight_decay,
+         ce_loss_weight=1.0,
+         no_eval=False,
+         eval_only=False,
+@@ -1036,15 +1131,40 @@ def train(attn_implementation=None):
+     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
+ 
+     args = translate_args(model_args, data_args, training_args)
+-    args.log_dir = os.path.join(args.log_base_dir, args.exp_name)
++    args.log_dir = training_args.output_dir
+     world_size = torch.cuda.device_count()
+     args.distributed = world_size > 1
+ 
+     bnb_model_from_pretrained_args = {}
+     # writer = None
++    args.wandb_run = None
+     if local_rank == 0:
+         os.makedirs(args.log_dir, exist_ok=True)
+         writer = SummaryWriter(args.log_dir)
++        report_targets = training_args.report_to
++        if isinstance(report_targets, str):
++            report_targets = [report_targets]
++        if "wandb" in report_targets:
++            import wandb
++
++            args.wandb_run = wandb.init(
++                project=os.environ.get("WANDB_PROJECT", "ImageToGarment"),
++                entity=os.environ.get("WANDB_ENTITY") or None,
++                name=os.environ.get(
++                    "WANDB_RUN_NAME", os.path.basename(args.log_dir.rstrip("/"))
++                ),
++                dir=args.log_dir,
++                config={
++                    "epochs": args.epochs,
++                    "batch_size": args.batch_size,
++                    "gradient_accumulation_steps": args.grad_accumulation_steps,
++                    "learning_rate": args.lr,
++                    "weight_decay": args.weight_decay,
++                    "lora_r": args.lora_r,
++                    "lora_alpha": args.lora_alpha,
++                    "lora_dropout": args.lora_dropout,
++                },
++            )
+     else:
+         writer = None
+ 
+@@ -1199,7 +1319,15 @@ def make_inputs_require_grad(module, input, output):
+                                               data_args=data_args, data_path_list=data_path_list)
+     
+     rank0_print('train_dataset', len(train_dataset))
+-    # assert False
++    rank0_print('val_dataset', len(val_dataset))
++    world_size = max(1, int(os.environ.get("WORLD_SIZE", "1")))
++    micro_batches = math.ceil(
++        len(train_dataset) / (args.batch_size * world_size)
++    )
++    args.steps_per_epoch = max(
++        1, math.ceil(micro_batches / args.grad_accumulation_steps)
++    )
++    rank0_print('optimizer steps per epoch', args.steps_per_epoch)
+ 
+     ds_config = {
+         "train_micro_batch_size_per_gpu": args.batch_size,
+@@ -1208,7 +1336,7 @@ def make_inputs_require_grad(module, input, output):
+             "type": "AdamW",
+             "params": {
+                 "lr": args.lr,
+-                "weight_decay": 0.0,
++                "weight_decay": args.weight_decay,
+                 "betas": (args.beta1, args.beta2),
+             },
+         },
+@@ -1218,7 +1346,7 @@ def make_inputs_require_grad(module, input, output):
+                 "total_num_steps": args.epochs * args.steps_per_epoch,
+                 "warmup_min_lr": 0,
+                 "warmup_max_lr": args.lr,
+-                "warmup_num_steps": 100,
++                "warmup_num_steps": max(1, int(training_args.warmup_ratio * args.epochs * args.steps_per_epoch)),
+                 "warmup_type": "linear",
+             },
+         },
+@@ -1246,6 +1374,14 @@ def make_inputs_require_grad(module, input, output):
+         collate_fn=collate_fn,
+         config=ds_config,
+     )
++    val_loader = torch.utils.data.DataLoader(
++        val_dataset,
++        batch_size=args.val_batch_size,
++        shuffle=False,
++        num_workers=args.workers,
++        pin_memory=True,
++        collate_fn=collate_fn,
++    )
+ 
+     resume = os.path.join(args.log_dir, "ckpt_model")
+     if args.resume:
+@@ -1277,6 +1413,9 @@ def make_inputs_require_grad(module, input, output):
+             train_iter,
+             args,
+         )
++        validate_epoch(
++            val_loader, model_engine, tokenizer, epoch, writer, args
++        )
+ 
+         if True:
+             best_score = 0.0
+@@ -1297,6 +1436,9 @@ def make_inputs_require_grad(module, input, output):
+             torch.distributed.barrier()
+             model_engine.save_checkpoint(save_dir)
+ 
++    if args.local_rank == 0 and args.wandb_run is not None:
++        args.wandb_run.finish()
++
+ 
+ if __name__ == "__main__":
+     train()
+diff --git a/scripts/evaluate_garment_v2_imggen_1float.py b/scripts/evaluate_garment_v2_imggen_1float.py
+index 6a81877..02ccc78 100644
+--- a/scripts/evaluate_garment_v2_imggen_1float.py
++++ b/scripts/evaluate_garment_v2_imggen_1float.py
+@@ -289,7 +289,7 @@ def make_inputs_require_grad(module, input, output):
+     )
+ 
+     ########################################################################################
+-    resume_path = 'checkpoints/try_7b_lr1e_4_v3_garmentcontrol_4h100_v4_final/pytorch_model.bin'
++    resume_path = os.environ.get('CHATGARMENT_RESUME_PATH', 'checkpoints/try_7b_lr1e_4_v3_garmentcontrol_4h100_v4_final/pytorch_model.bin')
+     state_dict = torch.load(resume_path, map_location="cpu")
+     model.load_state_dict(state_dict, strict=True)
+     model = model.bfloat16().cuda()
+@@ -302,7 +302,8 @@ def make_inputs_require_grad(module, input, output):
+     else:
+         dataset_name = data_args.data_path_eval.split('/')[-1]
+         
+-    args.exp_name = resume_path.split('/')[-2]
++    args.log_base_dir = os.environ.get('CHATGARMENT_LOG_BASE_DIR', args.log_base_dir)
++    args.exp_name = os.environ.get('CHATGARMENT_EXP_NAME', os.path.basename(os.path.dirname(resume_path)))
+     parent_folder = os.path.join(args.log_base_dir, args.exp_name, f'{dataset_name}_img_recon')
+     if not os.path.exists(parent_folder):
+         os.makedirs(parent_folder)

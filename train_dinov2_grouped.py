@@ -196,10 +196,12 @@ class GroupedGarmentDinoModel(nn.Module):
         waistband_hidden_dim: int = 64,
         dropout: float = 0.1,
         freeze_backbone: bool = True,
+        bounded_regression: bool = True,
     ) -> None:
         super().__init__()
         self.backbone = torch.hub.load("facebookresearch/dinov2", backbone_name)
         self.freeze_backbone = freeze_backbone
+        self.bounded_regression = bounded_regression
         self.classification_frozen = False
         self.group_layout = build_group_layout(schema)
         self.reg_dim = int(schema["n_cont"]) + int(schema["n_const"])
@@ -275,7 +277,8 @@ class GroupedGarmentDinoModel(nn.Module):
             pred_reg = pred_reg.index_copy(1, reg_indices, group_reg)
             pred_logits = pred_logits.index_copy(1, cat_indices, group_cat)
 
-        # Regression outputs stay linear during training. Clamp only in decode.
+        if self.bounded_regression:
+            pred_reg = torch.sigmoid(pred_reg)
         return pred_reg, pred_logits
 
     def classification_parameters(self) -> Iterator[nn.Parameter]:
@@ -427,6 +430,13 @@ def parse_args() -> argparse.Namespace:
         default=1e-4,
         help="minimum categorical val-loss improvement that resets patience",
     )
+    parser.add_argument(
+        "--unbounded-regression",
+        action="store_false",
+        dest="bounded_regression",
+        help="legacy mode: keep grouped regression outputs linear",
+    )
+    parser.set_defaults(bounded_regression=True)
     parser.add_argument("--unfreeze-backbone", action="store_true")
     parser.add_argument("--amp", action="store_true", help="use CUDA mixed precision")
     parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"))
@@ -719,6 +729,7 @@ def main() -> None:
         waistband_hidden_dim=args.waistband_hidden_dim,
         dropout=args.dropout,
         freeze_backbone=not args.unfreeze_backbone,
+        bounded_regression=args.bounded_regression,
     ).to(device)
 
     optimizer = make_optimizer(model, args)

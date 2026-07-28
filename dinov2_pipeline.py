@@ -5,6 +5,8 @@ Architectures:
 
 * ``baseline`` uses the two flat heads from ``train_dinov2.py``.
 * ``modelpy`` uses the per-parameter heads from ``model.py``.
+* ``grouped`` uses the three semantic MLP heads (upper, lower, waistband)
+  from ``train_dinov2_grouped.py``.
 
 Inference detects the architecture stored in new checkpoints. Checkpoints made by
 the original ``train_dinov2.py`` are treated as ``baseline`` checkpoints.
@@ -160,9 +162,8 @@ def log_wandb_epoch(
         )
     payload.update(
         {
-            "gap/loss": val_metrics["loss"] - train_metrics["loss"],
             "gap/loss_reg": val_metrics["loss_reg"] - train_metrics["loss_reg"],
-            "gap/loss_cat": val_metrics["loss_cat"] - train_metrics["loss_cat"],
+            "gap/cat_acc": train_metrics["cat_acc"] - val_metrics["cat_acc"],
             "best/val_loss": best_val,
             "optim/lr": float(optimizer.param_groups[0]["lr"]),
         }
@@ -420,6 +421,7 @@ def compute_modelpy_losses(
     label_smoothing: float = 0.0,
     reg_loss: str = "mse",
     smooth_l1_beta: float = 0.05,
+    use_class_weights: bool = True,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     first_param = next(iter(outputs["params"].values()))
     first_tensor = next(iter(first_param.values()))
@@ -490,7 +492,7 @@ def compute_modelpy_losses(
                     )
                 mapped_target = mapped_target.long()
                 mapped_target[~valid] = -1
-            class_weights = source.get("class_weights")
+            class_weights = source.get("class_weights") if use_class_weights else None
             loss_cat = loss_cat + F.cross_entropy(
                 logits,
                 mapped_target,
@@ -517,9 +519,52 @@ def compute_modelpy_losses(
         "loss_reg": float(loss_reg.detach().cpu()),
         "loss_cat": float(loss_cat.detach().cpu()),
         "cat_acc": correct / total if total else 0.0,
+        "_cat_correct": correct,
+        "_cat_total": total,
     }
     return loss, values
 
+
+def configure_flat_class_weights(
+    dataset: Any,
+    vocab_sizes: list[int],
+    method: str,
+    beta: float = 0.999,
+    max_weight: float = 5.0,
+) -> list[list[float] | None]:
+    """Estimate flat-head class weights from unique training garments."""
+    if method == "none":
+        return [None] * len(vocab_sizes)
+    if not 0.0 <= beta < 1.0:
+        raise ValueError("--class-weight-beta must be in [0, 1)")
+    if max_weight <= 0:
+        raise ValueError("--class-weight-max must be positive")
+
+    rows = torch.tensor(
+        [dataset.row_of[gid] for gid in dataset.garment_ids], dtype=torch.long
+    )
+    result: list[list[float] | None] = []
+    for field_idx, vocab_size in enumerate(vocab_sizes):
+        target = torch.from_numpy(dataset.y_cat[:, field_idx].copy())[rows]
+        target = target[target.ne(-1)].long()
+        if not target.numel():
+            result.append(None)
+            continue
+        counts = torch.bincount(target, minlength=vocab_size).float()
+        observed = counts.gt(0)
+        weights = torch.ones_like(counts)
+        if method == "balanced":
+            weights[observed] = counts[observed].sum() / (
+                observed.sum() * counts[observed]
+            )
+        else:
+            weights[observed] = (1.0 - beta) / (
+                1.0 - beta ** counts[observed]
+            )
+        weights[observed] /= weights[observed].mean()
+        weights.clamp_(max=max_weight)
+        result.append(weights.tolist())
+    return result
 
 def run_epoch(
     model: nn.Module,
@@ -530,6 +575,7 @@ def run_epoch(
     device: torch.device,
     vocab_sizes: list[int],
     adapter: PreparedTargetAdapter | None,
+    flat_class_weights: list[list[float] | None] | None,
     lambda_cat: float,
     label_smoothing: float,
     reg_loss: str,
@@ -541,7 +587,7 @@ def run_epoch(
 ) -> dict[str, float]:
     is_train = optimizer is not None
     model.train(is_train)
-    if architecture == "baseline" and model.freeze_backbone:
+    if architecture in {"baseline", "grouped"} and model.freeze_backbone:
         model.backbone.eval()
 
     stats = BatchStats()
@@ -553,10 +599,18 @@ def run_epoch(
                 break
             batch = move_batch(batch, device)
             with torch.autocast(device_type="cuda", enabled=amp and device.type == "cuda"):
-                if architecture == "baseline":
+                if architecture in {"baseline", "grouped"}:
                     pred_reg, pred_logits = model(batch["image"])
                     loss, values = compute_baseline_losses(
-                        pred_reg, pred_logits, batch, vocab_sizes, lambda_cat
+                        pred_reg,
+                        pred_logits,
+                        batch,
+                        vocab_sizes,
+                        lambda_cat,
+                        label_smoothing=label_smoothing if is_train else 0.0,
+                        class_weights=flat_class_weights if is_train else None,
+                        reg_loss=reg_loss,
+                        smooth_l1_beta=smooth_l1_beta,
                     )
                 else:
                     assert adapter is not None
@@ -566,9 +620,10 @@ def run_epoch(
                         batch,
                         adapter,
                         lambda_cat,
-                        label_smoothing=label_smoothing,
+                        label_smoothing=label_smoothing if is_train else 0.0,
                         reg_loss=reg_loss,
                         smooth_l1_beta=smooth_l1_beta,
+                        use_class_weights=is_train,
                     )
 
             if is_train:
@@ -607,6 +662,21 @@ def build_training_model(
             reg_dim=int(schema["n_cont"]) + int(schema["n_const"]),
             cat_vocab_sizes=cat_vocab_sizes(schema),
             hidden_dim=args.hidden_dim,
+            dropout=args.dropout,
+            freeze_backbone=not args.unfreeze_backbone,
+            bounded_regression=args.bounded_regression,
+        )
+        return model.to(device), None, None
+
+    if args.architecture == "grouped":
+        from train_dinov2_grouped import GroupedGarmentDinoModel
+
+        model = GroupedGarmentDinoModel(
+            schema=schema,
+            backbone_name=args.backbone,
+            hidden_dim=args.hidden_dim,
+            branch_hidden_dim=args.branch_hidden_dim,
+            waistband_hidden_dim=args.waistband_hidden_dim,
             dropout=args.dropout,
             freeze_backbone=not args.unfreeze_backbone,
             bounded_regression=args.bounded_regression,
@@ -680,9 +750,18 @@ def train(args: argparse.Namespace) -> None:
     train_loader, val_loader, schema = make_loaders(args)
     vocab_sizes = cat_vocab_sizes(schema)
     model, adapter, model_schema = build_training_model(args, schema, device)
+    flat_class_weights = None
     if adapter is not None:
         adapter.configure_class_weights(
             train_loader.dataset,
+            args.class_weighting,
+            beta=args.class_weight_beta,
+            max_weight=args.class_weight_max,
+        )
+    else:
+        flat_class_weights = configure_flat_class_weights(
+            train_loader.dataset,
+            vocab_sizes,
             args.class_weighting,
             beta=args.class_weight_beta,
             max_weight=args.class_weight_max,
@@ -739,6 +818,7 @@ def train(args: argparse.Namespace) -> None:
             device,
             vocab_sizes,
             adapter,
+            flat_class_weights,
             args.lambda_cat,
             args.label_smoothing,
             args.reg_loss,
@@ -757,6 +837,7 @@ def train(args: argparse.Namespace) -> None:
             device,
             vocab_sizes,
             adapter,
+            flat_class_weights,
             args.lambda_cat,
             args.label_smoothing,
             args.reg_loss,
@@ -879,6 +960,9 @@ def build_grouped_inference_model(
         waistband_hidden_dim=int(train_args.get("waistband_hidden_dim", 64)),
         dropout=float(train_args.get("dropout", 0.1)),
         freeze_backbone=not bool(train_args.get("unfreeze_backbone", False)),
+        # Legacy grouped checkpoints used linear outputs; new checkpoints record
+        # bounded_regression=True and keep normalized predictions in [0, 1].
+        bounded_regression=bool(train_args.get("bounded_regression", False)),
     )
     model.load_state_dict(checkpoint["model"])
     return model.to(device).eval()
@@ -1007,6 +1091,9 @@ def infer(args: argparse.Namespace) -> None:
     if architecture == "baseline":
         model = build_baseline_inference_model(checkpoint, device)
         adapter = None
+    elif architecture == "grouped":
+        model = build_grouped_inference_model(checkpoint, device)
+        adapter = None
     else:
         model, adapter = build_modelpy_inference_model(checkpoint, args, device)
 
@@ -1024,7 +1111,7 @@ def infer(args: argparse.Namespace) -> None:
     image = load_image(image_path, image_size, device)
 
     with torch.inference_mode():
-        if architecture == "baseline":
+        if architecture in {"baseline", "grouped"}:
             pred_reg, pred_logits = model(image)
             prediction = decode_baseline_prediction(
                 pred_reg, pred_logits, checkpoint["schema"]
@@ -1055,7 +1142,7 @@ def infer(args: argparse.Namespace) -> None:
         handle.write("\n")
     print(f"wrote {out_json}")
 
-    if architecture == "baseline":
+    if architecture in {"baseline", "grouped"}:
         write_baseline_yaml(result, args.template, args.source_mode, str(out_yaml))
     else:
         out_yaml.parent.mkdir(parents=True, exist_ok=True)
@@ -1105,7 +1192,7 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser = subparsers.add_parser(
         "train", help="train either architecture", formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    train_parser.add_argument("--architecture", choices=("baseline", "modelpy"), default="baseline")
+    train_parser.add_argument("--architecture", choices=("baseline", "modelpy", "grouped"), default="baseline")
     train_parser.add_argument("--prepared-dir", default="prepared_v2")
     train_parser.add_argument("--out-dir")
     train_parser.add_argument("--backbone", default="dinov2_vitl14")
@@ -1118,7 +1205,9 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--num-workers", type=int, default=4)
     train_parser.add_argument("--lr", type=float, default=1e-3)
     train_parser.add_argument("--weight-decay", type=float, default=1e-4)
-    train_parser.add_argument("--hidden-dim", type=int, default=512, help="baseline head width")
+    train_parser.add_argument("--hidden-dim", type=int, default=512, help="baseline head width or grouped shared-trunk width")
+    train_parser.add_argument("--branch-hidden-dim", type=int, default=128, help="grouped upper/lower MLP width")
+    train_parser.add_argument("--waistband-hidden-dim", type=int, default=64, help="grouped waistband MLP width")
     train_parser.add_argument(
         "--head-hidden-dims", type=int, nargs="+", default=[64, 32], help="model.py per-head widths"
     )
@@ -1185,7 +1274,7 @@ def build_parser() -> argparse.ArgumentParser:
     infer_parser = subparsers.add_parser(
         "infer", help="infer with either checkpoint", formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    infer_parser.add_argument("--architecture", choices=("auto", "baseline", "modelpy"), default="auto")
+    infer_parser.add_argument("--architecture", choices=("auto", "baseline", "modelpy", "grouped"), default="auto")
     infer_parser.add_argument("--checkpoint", default="runs/dinov2_vits14/best.pt")
     infer_parser.add_argument("--prepared-dir", default="prepared_v2")
     infer_parser.add_argument("--gid")
