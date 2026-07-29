@@ -71,6 +71,7 @@ third_party/
 GarmentImages/
 data/
 prepared_v2/
+prepared_edit/
 runs/
 verify_dump/
 
