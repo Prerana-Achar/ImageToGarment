@@ -82,9 +82,6 @@ slurm/logs/*.out
 # Edit-model batch scripts stay local
 runners/slurm/batch/*edit*.sbatch
 
-# Git metadata is stored here in this managed workspace
-.repo-git/
-
 # Condor logs
 runners/condor/logs/*.err
 runners/condor/logs/*.out
