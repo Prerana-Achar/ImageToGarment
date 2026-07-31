@@ -1,395 +1,363 @@
-# ChatGarment Data Pipeline (`prepare_data.py`)
+# ImageToGarment
 
-Turns the raw [ChatGarment dataset](https://huggingface.co/datasets/sy000/ChatGarmentDataset)
-(`sy000/ChatGarmentDataset`) into a clean, frozen train/val/test split ready for a
-PyTorch image → sewing-pattern model. One command produces four files and a
-ready-to-use `GarmentDataset`.
+Reconstruct a complete **GarmentCode sewing-pattern design** from a **single RGB image**.
 
-## Cluster Quick Start
+The repository covers the full path from raw renders to a draped 3D garment:
 
-To fetch v1/v2/v3/v4 and build the combined training manifest on the cluster:
-
-```bash
-cd /is/cluster/pachar/Projects/ImageToGarment
-bash scripts/fetch_all_fast_data.sh
+```
+raw dataset ──► prepared data ──► model ──► design.yaml ──► GarmentCode drape + render
+ (ChatGarment /  (schema.json,    (DINOv2 heads /  (prediction_to_yaml)   (render_garmentcode)
+  GarmentCodeSMPLX) targets.npz)    tree / ensemble)
 ```
 
-This writes `/is/cluster/fast/pachar/Data/ImageToGarment/prepared_all`, which the Condor training runner uses by default.
-
-To skip the very large v1 rest-pose shards and prepare v2/v3/v4 only:
-
-```bash
-INCLUDE_V1=0 bash scripts/fetch_all_fast_data.sh
-```
+Every model predicts the same target contract: **normalized numeric parameters** (with an
+active/inactive mask) plus **categorical topology selectors** (`meta.upper`, `meta.wb`,
+`meta.bottom`, cuff types, …). Because the schema is a *union* over all garment families,
+any single garment only activates the slots reachable from its own topology.
 
 ---
 
-## 1. What the raw data is
+## Contents
 
-ChatGarment renders each procedurally-generated garment (a "gid") on a body at
-several **pose frames** (`0, 30, 60, …`), each from **4 camera views**
-(`000–003`). The reconstruction target for every image is a GarmentCode
-_design config_.
+| Area | Entry points |
+| --- | --- |
+| Data preparation | `prepare_data.py`, `prepare_garmentcode_smplx.py`, `compile_balanced_garmentcode_smplx.py`, `compile_output_balanced_garmentcode_smplx.py`, `compile_chatgarment_auxiliary.py` |
+| DINOv2 regression models | `dinov2_pipeline.py` (`baseline` / `modelpy` / `grouped`) |
+| Tree-structured model | `train_garment_tree.py`, `garment_tree_model.py` |
+| Route-constrained ensemble | `train_garment_ensemble.py`, `garment_ensemble_model.py` |
+| Text-instruction editing (LLM) | `prepare_edit_data.py`, `train_edit_model.py`, `edit_model.py` |
+| Mesh fitting / TRELLIS.2 route | `mesh_fitting_gnn.py`, `scripts/person_garment_trellis_gnn_pipeline.py` |
+| Decoding + rendering | `prediction_to_yaml.py`, `render_garmentcode.py` |
+| Cluster jobs | `runners/condor/`, `runners/slurm/batch/` |
 
-The file `training/synthetic/data_img_v*.json` is a JSON array with **one row per
-image**. Each row:
-
-```jsonc
-{
-  "image": "/ps/.../hood_simulation_garmentcode_v2/1327/motion_0/imgs/0/img/000.png",
-  "conversations": [
-    {"from": "human", "value": "<image>\nCan you estimate the outfit sewing pattern code?"},
-    {"from": "gpt",   "value": "{'upperbody_garment': {'meta': {...}, 'collar': {'width': [SEG], 'fc_angle': 88, ...}}}"}
-  ],
-  "all_floats": [[0.89, 0.30, ...]]   // the values behind the [SEG] tokens, in order
-}
-```
-
-Format quirks the pipeline handles for you:
-
-- The `gpt` value is a **Python-repr dict** (single quotes, `null`/`true`/`false`),
-  _not_ JSON. Parsed with `ast.literal_eval` after keyword substitution.
-- **`[SEG]`** marks each continuous value the model must regress. The i-th `[SEG]`
-  in document order corresponds to the i-th entry of flattened `all_floats`. These
-  floats are **already normalized to 0–1** by ChatGarment.
-- Plain numbers with no `[SEG]` (e.g. `fc_angle: 88`) are **fixed constants** —
-  real per-garment values ChatGarment chose not to make `[SEG]` targets.
-- String / bool / `null` leaves are **categoricals**.
-- All rows of one gid share the identical config and `all_floats`; only the
-  `image` path differs.
-
-### The split-garment "ownership" subtlety (important)
-
-Some records are a single `wholebody_garment`. Others are split into
-`upperbody_garment` **and** `lowerbody_garment`. In split records **each half is a
-complete, independently-sampled outfit** — so `upperbody_garment` carries its own
-_throwaway_ bottom (a skirt/pants that was generated but never rendered) and
-`lowerbody_garment` carries a throwaway top. Naively merging the two halves
-injects garbage (e.g. gid `v2_1327`'s upper half claims `SkirtManyPanels`, but the
-rendered skirt is the lower half's `SkirtLevels`).
-
-The pipeline resolves this with an **ownership filter** (`is_owned_path`): for
-split records it keeps only `shirt/collar/sleeve/left` (+`meta.upper`) from the
-upper half and the skirt/pants groups + `waistband` (+`meta.wb`, `meta.bottom`)
-from the lower half. Discarded values never become schema slots or training
-targets. (Verified visually — the reconstructed design for `v2_1327` renders in
-GarmentCode as the correct strapless-top + fitted-waistband + levels-skirt.)
+Companion documents: [`GARMENT_TREE_MODEL.md`](GARMENT_TREE_MODEL.md),
+[`GARMENT_TREE_RUN.md`](GARMENT_TREE_RUN.md), [`BALANCED_DATASET.md`](BALANCED_DATASET.md),
+[`runners/condor/README.md`](runners/condor/README.md),
+[`docs/TRELLIS2_CLUSTER_SETUP.md`](docs/TRELLIS2_CLUSTER_SETUP.md).
 
 ---
 
-## 2. Prerequisites
+## Requirements
 
-**Python** 3.11, packages: `numpy`, `Pillow`, `torch`, `torchvision`. No
-HuggingFace dependency. (`--help` and building the outputs need only numpy/Pillow;
-`torch`/`torchvision` are imported for the `GarmentDataset` at the bottom of the
-file.)
+Python 3.11 with `torch`, `torchvision`, `numpy`, `Pillow`, `pyyaml`.
+Additionally: `wandb` (optional logging), `matplotlib` (`scripts/plot_history.py`),
+`transformers` + `peft` + `bitsandbytes` (editing model), `pygarment` / a local
+`GarmentCodeRC` checkout (rendering), `pytest` (tests).
 
-**Data on disk** — you must have already downloaded and extracted:
-
-1. One or more `data_img_v*.json` files, e.g.
-   `data/chatgarment_data/training/synthetic/data_img_v2.json`.
-2. The matching extracted image folder(s), laid out as
-   `<root>/<gid>/motion_0/imgs/<frame>/img/00[0-3].png`, e.g.
-   `data/chatgarment_data/garments_imgs_v2_3/`.
-
-> The script does **not** download or unzip anything — it reads local files only.
-
-**⚠ gid numbers are reused across dataset versions.** `gid 1` in v2 is a _different
-garment_ than `gid 1` in v3. So each JSON must be paired with **only its own**
-image folders, and the pipeline can't auto-detect the pairing — you assert it (see
-multi-version usage). Do **not** extract v2 and v3 zips into the same directory.
-
-### Downloading the raw data from HuggingFace
-
-The full repo is **hundreds of GB** — don't `snapshot_download` the whole thing.
-Pull only the JSON(s) and the matching image zip(s) you actually need.
-
-```bash
-pip install -U "huggingface_hub[cli]"
-
-# the small JSON files (a few hundred MB to ~1.4 GB each)
-huggingface-cli download sy000/ChatGarmentDataset \
-  training/synthetic/data_img_v2.json \
-  --repo-type dataset --local-dir ./data/chatgarment_data
-
-# the matching image zip (large -- see table below for sizes)
-huggingface-cli download sy000/ChatGarmentDataset \
-  garments_imgs_v2_3.zip \
-  --repo-type dataset --local-dir ./data/chatgarment_data
-```
-
-Then extract in place, e.g.:
-
-```bash
-cd data/chatgarment_data && unzip garments_imgs_v2_3.zip -d garments_imgs_v2_3
-```
-
-| version        | JSON (`--json`)                                | image zip(s) (`--image-root` after unzip)                                    | zip size            |
-| -------------- | ---------------------------------------------- | ---------------------------------------------------------------------------- | ------------------- |
-| v2             | `training/synthetic/data_img_v2.json`          | `garments_imgs_v2_1.zip`, `garments_imgs_v2_2.zip`, `garments_imgs_v2_3.zip` | ~32 / ~32 / ~8 GB   |
-| v3             | `training/synthetic/data_img_v3.json`          | `garments_imgs_v3.zip`                                                       | ~27 GB              |
-| v4             | `training/synthetic/data_img_v4.json`          | `garments_imgs_v4.zip`                                                       | ~19 GB              |
-| v1 (rest-pose) | `training/synthetic/data_restpose_img_v1.json` | `garments_imgs_v1_1.zip` … `garments_imgs_v1_5.zip`                          | ~32 GB × 4 + ~28 GB |
-
-> **Only the `v2` ↔ `garments_imgs_v2_3` pairing above has been empirically
-> verified** (on-disk frame sets match `data_img_v2.json`'s references for
-> 1068/1069 local gids). The other JSON↔zip pairings follow the same naming
-> convention but have not been individually re-verified — do the same frame-set
-> sanity check before trusting a new pairing (see §7).
-
-You don't need every shard of a version — `garments_imgs_v2_3.zip` alone is
-enough to exercise the pipeline (it's what `prepared_v2` in this repo was built
-from); add `v2_1`/`v2_2` later only if you want more garments covered.
+Neither GarmentCode nor DINOv2 nor the datasets are vendored — they are expected as local
+checkouts/downloads (see `.gitignore`).
 
 ---
 
-## 3. Usage
+## 1. Data
 
-### Single version (the common case)
+Two ground-truth sources are supported, both reduced to the same four files.
+
+### 1a. ChatGarment (`prepare_data.py`)
+
+Turns the [ChatGarment dataset](https://huggingface.co/datasets/sy000/ChatGarmentDataset)
+(`sy000/ChatGarmentDataset`) into a frozen train/val/test split.
 
 ```bash
 python prepare_data.py \
-  --json       ./data/chatgarment_data/training/synthetic/data_img_v2.json \
-  --image-root ./data/chatgarment_data/garments_imgs_v2_3 \
+  --json       data/chatgarment_data/training/synthetic/data_img_v2.json \
+  --image-root data/chatgarment_data/garments_imgs_v2_3 \
   --tag        v2 \
-  --out        ./prepared_v2
+  --out        prepared_v2
 ```
 
-`--tag v2` namespaces output gids as `v2_1327` (keeps ids unique if you later add
-other versions). Multiple `--json` / `--image-root` values are allowed and all
-share the one `--tag`.
-
-### Multiple versions (pair each JSON with its own roots)
+Multiple versions must be paired explicitly, because **gid numbers are reused across
+versions** (`gid 1` in v2 ≠ `gid 1` in v3):
 
 ```bash
 python prepare_data.py \
-  --set v2 ./.../data_img_v2.json  ./.../garments_imgs_v2_1 ./.../garments_imgs_v2_3 \
-  --set v3 ./.../data_img_v3.json  ./.../garments_imgs_v3 \
-  --out ./prepared_all
+  --set v2 .../data_img_v2.json .../garments_imgs_v2_1 .../garments_imgs_v2_3 \
+  --set v3 .../data_img_v3.json .../garments_imgs_v3 \
+  --out prepared_all
 ```
 
-Each `--set TAG JSON ROOT [ROOT...]` is scanned in isolation — a JSON is only ever
-matched against the roots you paired with it, which is what prevents cross-version
-gid collisions. The schema is still built as the **union across all sets**, so one
-model trains on every version with stable slot indices. Use `--set` **or**
-`--json/--image-root`, not both.
+Each `--set TAG JSON ROOT…` is scanned in isolation; the schema is still the union over all
+sets, so slot indices stay stable. Use `--set` **or** `--json/--image-root`, never both.
 
-### All flags
+Key flags: `--frames` (default `0`; `all` for every pose — images only, never the schema),
+`--val`/`--test` (0.1/0.1), `--seed` (42), `--limit N` (smoke test).
 
-| flag                   | default       | meaning                                                                                        |
-| ---------------------- | ------------- | ---------------------------------------------------------------------------------------------- |
-| `--json`               | —             | one or more`data_img_v*.json` (single-version mode)                                            |
-| `--image-root`         | —             | local dirs holding`<gid>/motion_*/…` (single-version mode)                                     |
-| `--tag`                | `""`          | gid namespace prefix                                                                           |
-| `--set TAG JSON ROOT…` | —             | multi-version mode, repeatable                                                                 |
-| `--out`                | _required_    | output directory                                                                               |
-| `--frames`             | `0`           | pose frames to keep (`0`, or `0 30 60`, or `all`). **Images only — never affects the schema.** |
-| `--val` / `--test`     | `0.1` / `0.1` | split fractions (rest is train)                                                                |
-| `--seed`               | `42`          | frozen split seed                                                                              |
-| `--limit N`            | —             | process only first N records/file (smoke test)                                                 |
+On the cluster, `bash scripts/fetch_all_fast_data.sh` fetches v1–v4 and builds the combined
+manifest (`INCLUDE_V1=0` skips the very large rest-pose shards).
 
-`--frames` defaults to **frame `0` only**. Pass `--frames all` for every pose.
+### 1b. GarmentCodeSMPLX (`prepare_garmentcode_smplx.py`)
 
----
+The current default source: rendered ground-truth samples with `pose1`/`pose2`/`pose3`, a
+versioned design JSON, and a garment PKL. A folder is accepted only when all of those are
+present and readable.
 
-## 4. Outputs (written to `--out`)
-
-### `schema.json` — the slot layout (the "meaning" of every index)
-
-```jsonc
-{
-  "cont_slots":   { "upperbody_garment.collar.width": 0, ... },   // key_path -> index (152)
-  "const_slots":  { "upperbody_garment.collar.fc_angle": 0, ... },// key_path -> index (32)
-  "const_ranges": { "upperbody_garment.collar.fc_angle": [70, 110], ... }, // [min,max] per const
-  "cat_vocab":    { "lowerbody_garment.meta.bottom": ["Pants","PencilSkirt",...], ... }, // (60)
-  "n_cont": 152, "n_const": 32, "n_cat": 60
-}
+```bash
+bash scripts/prepare_smplx_data.sh          # → prepared_smplx
 ```
 
-### `targets.npz` — ground truth, **one row per garment**
+Splits are **by body**, never by image or garment — all three poses of every garment
+belonging to a held-out body stay in validation. When no source `val/` exists, 10 % of
+bodies are selected by a deterministic stratified score (garment count, categories, active
+categorical labels), audited in `split_selection.json`. Each pose is one independent
+single-image item; the model never receives multiple poses at once.
 
-| array        | shape      | meaning                                                    |
-| ------------ | ---------- | ---------------------------------------------------------- |
-| `gids`       | `(N,)`     | garment id per row (the join key), e.g.`"v2_1327"`         |
-| `y_cont`     | `(N, 152)` | `[SEG]` continuous values, already 0–1; `0` where inactive |
-| `mask`       | `(N, 152)` | `1` = active for this garment, `0` = not applicable        |
-| `y_const`    | `(N, 32)`  | fixed constants,**stored RAW** (degrees, counts, …)        |
-| `const_mask` | `(N, 32)`  | `1` = active, `0` = not applicable                         |
-| `y_cat`      | `(N, 60)`  | categorical class**index**; `-1` = not applicable          |
+### 1c. Balanced compilers
 
-`mask` / `-1` exist because the schema is a **union** over all garment types: any
-single garment only lights up the slots for its own structure (a pencil-skirt row
-has all `pants.*` / `flare-skirt.*` slots at mask 0). See §7 for why the mask is a
-deterministic function of the categoricals.
+| Compiler | Selection strategy |
+| --- | --- |
+| `compile_balanced_garmentcode_smplx.py` | Equal per-category quota in train and validation; within a category, favours rare categorical values and rare numeric bins. Fails loudly on category deficits. See [`BALANCED_DATASET.md`](BALANCED_DATASET.md). |
+| `compile_output_balanced_garmentcode_smplx.py` | Keeps **every** complete garment and balances exposure in *model-output space* — active heads, categorical classes, binned numeric values. |
+| `compile_chatgarment_auxiliary.py` | Maps ChatGarment prepared data onto an existing GarmentCode schema for auxiliary pretraining. |
 
-### `images.json` — where the photos are, per garment
+Both compilers emit `selection_manifest.json` and `balance_report.json`; training refuses to
+start unless `balance_report.json` has `ready: true` (override with `--allow-unbalanced-data`
+only while render generation is still running).
 
-```jsonc
-{
-  "v2_1327": {
-    "meta": ["FittedShirt", "FittedWB", "SkirtLevels"],
-    "frames": {
-      "0": ["<view000.png>", "<view001.png>", "<view002.png>", "<view003.png>"],
-    },
-  },
-}
-```
+### Outputs (identical for every preparer)
 
-### `splits.json` — frozen garment-id split
+| File | Contents |
+| --- | --- |
+| `schema.json` | `cont_slots`, `const_slots`, `const_ranges`, `cat_vocab` — the meaning of every index |
+| `targets.npz` | `gids`, `y_cont` + `mask`, `y_const` + `const_mask`, `y_cat` (`-1` = inactive) — one row per garment |
+| `images.json` | per-garment pose/view image paths (files are referenced, never copied) |
+| `splits.json` | frozen garment/body-level split with seed and ratios |
 
-```jsonc
-{ "train": [gids], "val": [gids], "test": [gids], "seed": 42, "ratios": [0.8,0.1,0.1] }
-```
-
-Split is **by garment id** (never by image row — that would leak a garment across
-splits) and **stratified** by the `(upper, wb, bottom)` signature so rare garment
-types appear in all three splits.
-
----
-
-## 5. Using `GarmentDataset` in training
+Use `GarmentDataset` from `prepare_data.py` to consume them:
 
 ```python
 from prepare_data import GarmentDataset
-from torch.utils.data import DataLoader
-
-train_ds = GarmentDataset("prepared_all", split="train", mode="single", train=True)
-val_ds   = GarmentDataset("prepared_all", split="val",   mode="single", train=False)
-
-loader = DataLoader(train_ds, batch_size=64, shuffle=True, num_workers=8)
-batch  = next(iter(loader))
-# batch["image"]      [B, 3, 224, 224]
-# batch["y_cont"]     [B, 152]   0-1
-# batch["mask"]       [B, 152]
-# batch["y_const"]    [B, 32]    ALREADY normalized to 0-1 (see §6)
-# batch["const_mask"] [B, 32]
-# batch["y_cat"]      [B, 60]    class indices, -1 = ignore
-# batch["gid"]        list[str]
+ds = GarmentDataset("prepared_smplx", split="train", mode="all_images", train=True)
+# batch: image [B,3,H,W], y_cont, mask, y_const, const_mask, y_cat, gid
 ```
 
-- `mode="single"`: `__len__` is the number of garments. Training picks one random
-  frame-0 view per garment per epoch; evaluation uses view 0 (or the first present
-  view).
-- `mode="all_images"`: the garment-level split is expanded into one item per
-  available frame-0 image. Every image is therefore visited once per epoch, while
-  all views of a garment remain in the same train/validation/test split.
-- Frame `0` is required in both modes; no other pose folder is used.
-- The default transform is Resize(224) → ToTensor → ImageNet normalize; pass your
-  own `transform=` to override.
-
-### Suggested model + loss (DINOv2 + two MLP heads)
-
-`y_cont` (152) and the 0–1 `y_const` (32) live on the same scale, so a single
-**regression head of width 184** covers both; a **classification head** covers the
-60 categorical fields.
-
-```python
-y_reg = torch.cat([batch["y_cont"], batch["y_const"]], dim=-1)      # [B, 184]
-m_reg = torch.cat([batch["mask"],   batch["const_mask"]], dim=-1)   # [B, 184]
-
-loss_reg = ((pred_reg - y_reg)**2 * m_reg).sum() / m_reg.sum().clamp(min=1)
-
-loss_cat, off = 0.0, 0
-for k, vocab in enumerate(vocab_sizes):        # vocab_sizes from schema cat_vocab
-    loss_cat += F.cross_entropy(pred_logits[:, off:off+vocab],
-                                batch["y_cat"][:, k], ignore_index=-1)
-    off += vocab
-
-loss = loss_reg + lambda_cat * loss_cat
-```
-
-`mask=0` → zero gradient for that slot; `ignore_index=-1` skips inapplicable
-categorical fields automatically.
-
-### Training baseline
-
-`train_dinov2.py` implements the DINOv2 + two-head baseline above. It loads the
-prepared split through `GarmentDataset`, freezes DINOv2 by default, trains a
-184-wide regression head (`y_cont` + normalized `y_const`) and a 199-wide
-categorical head (60 fields), and writes `last.pt`, `best.pt`, `history.json`,
-and `config.json`.
-
-```bash
-conda run -n project python train_dinov2.py \
-  --prepared-dir prepared_all \
-  --out-dir runs/dinov2_vits14 \
-  --epochs 20 \
-  --batch-size 32 \
-  --num-workers 8 \
-  --device cuda \
-  --amp
-```
-
-If `prepared_all/images.json` was created on another machine, rewrite the stored
-absolute image prefix at load time:
-
-```bash
-conda run -n project python train_dinov2.py \
-  --prepared-dir prepared_all \
-  --out-dir runs/dinov2_vits14 \
-  --image-path-prefix \
-    /Users/siddharth/Study/3dv_project/data/chatgarment_data/garments_imgs_v2_3 \
-    /mnt/beegfs/home/stud136/3dv_project/data/chatgarment_data/garments_imgs_v2_3
-```
-
-Useful options:
-
-- `--mode single` uses one sampled view per garment; `--mode all_images` uses every
-  available frame-0 image as its own training/evaluation sample.
-- `--unfreeze-backbone` fine-tunes DINOv2 instead of training only the heads.
-- `--amp` enables CUDA mixed precision.
-- `--max-train-batches 1 --max-val-batches 1` runs a quick smoke test.
+`mode="single"` samples one view per garment per epoch; `mode="all_images"` treats every
+image as its own item while keeping all views of a garment in the same split.
 
 ---
 
-## 6. Decoding predictions back to a GarmentCode design
+## 2. Models
 
-At inference you convert the 0–1 predictions back to real values, per slot:
+### 2a. DINOv2 regression heads — `dinov2_pipeline.py`
+
+One entry point, three architectures sharing data, checkpoints, YAML export and metrics:
+
+| `--architecture` | Head design | Implementation |
+| --- | --- | --- |
+| `baseline` | two flat heads: one regression head over `y_cont`+`y_const`, one categorical head | `train_dinov2.py` |
+| `modelpy` | one small MLP **per parameter**, typed from the GarmentCode schema | `model.py` |
+| `grouped` | shared trunk → three semantic MLPs (upper / lower / waistband) | `train_dinov2_grouped.py` |
+
+```bash
+python dinov2_pipeline.py train \
+  --architecture grouped \
+  --prepared-dir prepared_smplx \
+  --out-dir runs/garment_grouped \
+  --backbone dinov2_vitl14 \
+  --mode all_images --epochs 150 --batch-size 32 --device cuda --amp
+```
+
+Defaults worth knowing: frozen DINOv2-L backbone, light augmentation, dropout 0.1,
+SmoothL1 regression, effective-number class weighting, label smoothing 0.05, gradient
+clipping, `ReduceLROnPlateau`, early stopping (patience 30), checkpoints every 100 epochs.
+`--unfreeze-backbone` fine-tunes the encoder; `--wandb` logs curves.
+Grouped widths: `--hidden-dim` (trunk, 512), `--branch-hidden-dim` (128),
+`--waistband-hidden-dim` (64).
+
+Inference auto-detects the architecture stored in the checkpoint:
+
+```bash
+python dinov2_pipeline.py infer \
+  --checkpoint runs/garment_grouped/best.pt \
+  --image path/to/image.png \
+  --yaml-out output/design.yaml \
+  --render-3d --device cuda
+```
+
+`--render-upper/--render-wb/--render-bottom` override the inferred topology for rendering,
+which is useful for isolating topology errors from parameter errors.
+
+### 2b. GarmentTreeNet — `train_garment_tree.py`
+
+A network that mirrors the GarmentCode parameter tree:
+
+1. trainable multi-scale image encoder (contour detail + full silhouette);
+2. twelve learned **part queries** (global, waistband, shirt, collar, sleeve, asymmetry, each
+   skirt family, pants);
+3. categorical **topology decoded first**;
+4. numeric branches conditioned on the soft topology distribution, each emitting a bounded
+   value, an uncertainty, and an activity probability.
+
+```bash
+python train_garment_tree.py \
+  --prepared-dir prepared_smplx_balanced \
+  --out-dir runs/garment_tree_v1 \
+  --device cuda --amp
+```
+
+Training stays single-image; a second pose is used only as a prediction-consistency
+regularizer, and validation scores every pose independently. `best.pt` is the best
+exponential-moving-average checkpoint; `history.jsonl` holds all curves.
+`train_garment_tree_output_balanced.py` is the same loop driven by the output-balanced
+sampler.
+
+### 2c. Route-constrained ensemble — `train_garment_ensemble.py`
+
+Five bagged members over a **joint route distribution** across the three root selectors
+(`meta.upper`, `meta.wb`, `meta.bottom`). Only legal routes exist in the table, and root
+logits are recovered by marginalising the joint distribution — so a member can never emit an
+impossible topology combination. On top of that: a shared frozen patch encoder with a cached
+feature bank, out-of-fold training for the stacker, router warm-up then freezing, pose
+consistency, EMA weights, and optional auxiliary pretraining on ChatGarment-derived data
+(`--aux-prepared-dir`).
+
+```bash
+python train_garment_ensemble.py \
+  --prepared-dir prepared_smplx_balanced \
+  --out-dir runs/garment_tree_ensemble \
+  --members 5 --folds 5 --epochs 180 --device cuda
+```
+
+### 2d. Text-instruction editing — `train_edit_model.py`
+
+Instruction-conditioned garment editing with a QLoRA decoder LLM that **regresses** floats
+from hidden states instead of emitting digits. Two readout variants share the backbone, data
+and losses, so they are directly comparable:
+
+* `--variant single_token` (A, ChatGarment's scheme): one `<ALLNUM>` sentinel closes the
+  numeric section; its hidden state feeds an MLP that emits the whole `N_SLOTS` vector.
+* `--variant per_token` (B): each active float renders as one `<VAL>` token preceded by its
+  key; each `<VAL>` hidden state feeds a **shared** MLP emitting one scalar.
+
+```bash
+python prepare_edit_data.py --out prepared_edit          # 76-slot canonical layout
+python train_edit_model.py --variant per_token --out runs/edit_per_token
+python infer_edit.py --ckpt runs/edit_per_token/final --out preds.jsonl
+python eval_edit.py --preds preds.jsonl
+python edit_to_design.py --preds preds.jsonl --template <design.yaml>
+```
+
+The 76 editing slots are *derived* from the frozen 152-slot image schema by stripping the
+body prefix — never hand-written. Design invariants: regression heads are plain linear (no
+sigmoid/tanh — clamping happens at inference only, so genuine 0.0/1.0 boundary values remain
+reachable), the new special-token embedding rows are trainable via peft's
+`trainable_token_indices`, and hidden states are indexed **at** the special token's own
+position. Loss is `CE(target JSON tokens) + λ · L1(regressed floats)`.
+
+### 2e. Mesh route (TRELLIS.2 + GNN)
+
+`scripts/person_garment_trellis_gnn_pipeline.py` chains: person image → garment-only image
+(SegFormer clothes segmentation) → TRELLIS.2 mesh → GarmentCode mesh → MeshGraphNets-style
+template deformation (`mesh_fitting_gnn.py`, topology-agnostic losses). Each stage writes
+files so it can be inspected or rerun independently. TRELLIS.2 is external — see
+[`docs/TRELLIS2_CLUSTER_SETUP.md`](docs/TRELLIS2_CLUSTER_SETUP.md).
+
+### 2f. ChatGarment VLM comparison baseline
+
+`scripts/prepare_chatgarment_smplx_vlm.py` exports GarmentCodeSMPLX as ChatGarment-format
+manifests with normalized sparse `[SEG]` targets (train/val bodies disjoint), for LLaVA-7B
+LoRA training via `runners/condor/submit_chatgarment_smplx_h100.sh`. This exists to test
+whether a large VLM is actually necessary for the task.
+
+---
+
+## 3. Decoding predictions back to GarmentCode
 
 ```
-continuous ([SEG]):  raw = lo + pred * (hi - lo)         # lo,hi from GarmentCode default.yaml
-constants:           raw = lo + pred * (hi - lo)         # lo,hi from schema.json const_ranges
+continuous ([SEG]):  raw = lo + pred * (hi - lo)     # lo,hi from GarmentCode default.yaml
+constants:           raw = lo + pred * (hi - lo)     # lo,hi from schema.json const_ranges
 categoricals:        value = cat_vocab[field][argmax(logits_field)]
 ```
 
-then write into GarmentCode's design template with `prediction_to_yaml.py` or the integrated `dinov2_pipeline.py infer` path.
+`prediction_to_yaml.py` (or the integrated `dinov2_pipeline.py infer` path) writes the design
+YAML, casting by the **declared type** from the GarmentCode template.
 
-### ⚠ Do NOT blindly round all constants
+> **Do not blindly round all constants.** Constants sit on integer grids *except* the
+> float-valued `flare-skirt.skirt-many-panels.panel_curve` (range −0.35…0.45) under both
+> `lowerbody_garment` and `wholebody_garment`. Round only `type: int` params. `schema.json`
+> does not yet record int/float types — a standalone decoder must look them up in
+> `assets/design_params/default.yaml`.
 
-Constants sit on integer grids **except two float-valued ones**:
-`flare-skirt.skirt-many-panels.panel_curve` (range −0.35…0.45) under both
-`lowerbody_garment` and `wholebody_garment`. Rounding those to integers corrupts
-them. The correct rule is **round only `type: int` params**, leave `type: float`
-alone — the type comes from GarmentCode's `assets/design_params/default.yaml`.
-`prediction_to_yaml.py` casts by declared type from the GarmentCode template. **`schema.json` does not yet record this int/float type** — if you build a
-standalone decoder off `schema.json` alone, add the type lookup from `default.yaml`
-(or extend the schema to carry `const_types`).
+Render the result headlessly:
+
+```bash
+python render_garmentcode.py --design output/design.yaml --out-dir runs/garmentcode_reconstructions
+```
 
 ---
 
-## 7. Gotchas & invariants (read before trusting a run)
+## 4. Evaluating on GarmentImage
 
-- **The mask is a deterministic function of the categoricals**, not independent
-  information — a slot is active only because some type selector (e.g.
-  `meta.bottom`, `sleeve.cuff.type`) turned that branch on. The model does **not**
-  predict a mask. For training/eval on this dataset you already have the true mask
-  in `targets.npz`. For a novel unlabeled image, derive the mask from the
-  _predicted_ categoricals (or just fill the full 184-wide design template and let
-  GarmentCode read only the reachable subtree).
-- **`const_ranges` are empirical** (per-slot min/max over the records this run
-  saw). They are stable for a fixed set of `--json` files with no `--limit`, but a
-  `--limit` run or a different file set yields different ranges. **Always decode
-  with the same `schema.json` you trained against.** (The `[SEG]` 0–1 values, by
-  contrast, are fixed by ChatGarment and run-independent.)
-- **The schema is a union over ALL records** in the JSON, even garments whose
-  images you don't have locally — so slot indices stay stable across partial image
-  downloads. Columns for garment types absent from your local images stay
-  permanently inactive (all mask 0). Kept garments = valid config **and** ≥1 local
-  image passing `--frames`.
-- **Robustness:** unparseable records and `#[SEG] ≠ len(all_floats)` mismatches are
-  warned and skipped per-gid, never fatal.
+Batch inference + side-by-side renders against the GarmentImage dataset:
 
-### Reference run (v2, frame 0 only, full file)
+```bash
+# DINOv2 architectures
+python scripts/garmentimages_batch_infer.py \
+  --checkpoint runs/<run>/best.pt --architecture grouped \
+  --image-root /path/to/GarmentImage \
+  --out-dir runs/garmentimage_comparisons/grouped \
+  --device cuda --render-python venv/bin/python --garmentcode-dir GarmentCodeRC
+
+# tree / ensemble checkpoints
+python scripts/garmentimages_batch_infer_garment_tree.py \
+  --checkpoint runs/<run>/best.pt \
+  --out-dir runs/garmentimage_comparisons/<run> \
+  --device cuda --render-python venv/bin/python --garmentcode-dir GarmentCodeRC --skip-existing
+```
+
+Outputs land in `<out-dir>/{yaml,front_preview,side_by_side}/` plus `summary.csv`, which
+records success or the exact rendering error per input image. `--limit N` smoke-tests first.
+
+---
+
+## 5. Cluster
+
+**Condor** (`runners/condor/`) — each job has a `submit_*.sh` wrapper, a `.sub` file, and a
+`run_*.sh` payload; the second positional argument is usually the bid:
+
+```bash
+bash runners/condor/submit_h100.sh smplx_grouped grouped 150      # DINOv2 pipeline
+bash runners/condor/submit_garment_tree_balanced_h100.sh garment_tree_v1 150
+bash runners/condor/submit_garment_tree_ensemble_h100.sh ensemble_v1 150
+bash runners/condor/submit_chatgarment_smplx_h100.sh smplx_vlm_lora 150
+```
+
+Jobs request one 80 GB H100 and print their log and run directories. W&B credentials go in
+`runners/condor/secrets.sh` (git-ignored, `chmod 600`).
+
+**Slurm** (`runners/slurm/batch/*.sbatch`) covers the DINOv2 train/infer variants.
+
+If `images.json` was written on another machine, rewrite the stored prefix at load time:
+
+```bash
+--image-path-prefix /old/absolute/root /new/absolute/root
+```
+
+---
+
+## 6. Gotchas & invariants
+
+* **Split by garment/body id, never by image row.** All views and poses of a garment share
+  identical targets, so an image-level split leaks.
+* **The mask is a deterministic function of the categoricals**, not independent information —
+  a slot is active only because some type selector turned that branch on. For an unlabeled
+  image, derive the mask from the *predicted* categoricals.
+* **`const_ranges` are empirical** (per-slot min/max over the records a run saw). A `--limit`
+  run or a different file set yields different ranges — always decode with the same
+  `schema.json` you trained against. The `[SEG]` 0–1 values are run-independent.
+* **The schema is a union over all records**, including garments whose images you don't have,
+  so slot indices stay stable across partial downloads. Absent families stay permanently
+  mask-0.
+* **Split-record ownership (ChatGarment):** in records split into `upperbody_garment` +
+  `lowerbody_garment`, each half is an independently sampled complete outfit, so the upper
+  half carries a throwaway bottom and vice versa. `is_owned_path` keeps only
+  `shirt/collar/sleeve/left` (+`meta.upper`) from the upper half and the skirt/pants groups +
+  `waistband` (+`meta.wb`, `meta.bottom`) from the lower half. Naive merging injects garbage.
+* **Robustness:** unparseable records and `#[SEG] ≠ len(all_floats)` mismatches are warned and
+  skipped per-gid, never fatal.
+* **Legacy targets** `shirt.openfront` and `waistband.height` exist in prepared data but are
+  excluded from new models by default (`--include-unsupported-params` restores them).
+
+### Reference run (ChatGarment v2, frame 0, full file)
 
 ```
 [scan] records=350256 parsed_gids=9476 parse_fail=0 seg_mismatch=0
@@ -401,129 +369,36 @@ standalone decoder off `schema.json` alone, add the type lookup from `default.ya
 
 ---
 
+## 7. Tests
+
+```bash
+pytest tests/
+```
+
+`tests/test_garment_tree_model.py` exercises GarmentTreeNet shapes against a tiny schema;
+`tests/test_garment_ensemble_routes.py` checks route-constraint construction, route marginal
+recovery, and expert-head region routing.
+
+---
+
 ## 8. File map
 
-| file                     | role                                                      |
-| ------------------------ | --------------------------------------------------------- |
-| `prepare_data.py`        | data preparation pipeline and `GarmentDataset`            |
-| prepare_garmentcode_smplx.py | ground-truth SMPL-X pose dataset preparer              |
-| `dinov2_pipeline.py`     | train/infer entrypoint for baseline, model.py, and grouped models |
-| `model.py`               | DINOv2 encoder plus per-parameter multihead MLP           |
-| `prediction_to_yaml.py`  | decode predictions into a GarmentCode design yaml         |
-| `render_garmentcode.py`  | render decoded GarmentCode outputs                        |
-
-
-### GarmentCodeSMPLX pose dataset
-
-The three training architectures now default to ground-truth samples in
-`/is/cluster/fast/pachar/Data/GarmentCodeSMPLX/train/samples`. Prepare completed
-folders, each containing `pose1`, `pose2`, `pose3`, and its matching JSON, with:
-
-```bash
-cd /is/cluster/pachar/Projects/ImageToGarment
-bash scripts/prepare_smplx_data.sh
-```
-
-This writes `/is/cluster/fast/pachar/Data/ImageToGarment/prepared_smplx`. Numeric
-labels remain raw in `targets.npz`; the models adapt their output ranges when a
-body-adjusted parameter exceeds the schema sampling range. No split sizes are
-chosen at image level. When no source validation folder exists, the preparer
-selects 10% of unique bodies using a deterministic stratified selector that
-balances garment count, garment categories, and active categorical labels.
-Bodies remain fully disjoint; set `VAL_FRACTION_OF_TRAIN_BODIES` to override
-the fraction. The decision and score components are saved in
-`split_selection.json`. The three poses become
-independent one-image items and are shuffled during training; the model input is
-still only one pose at a time.
-
-Submit the baseline, per-parameter multihead, or grouped three-MLP model:
-
-```bash
-bash runners/condor/submit_h100.sh smplx_baseline baseline 150
-bash runners/condor/submit_h100.sh smplx_multihead modelpy 150
-bash runners/condor/submit_h100.sh smplx_grouped grouped 150
-```
-
-### Grouped three-MLP model
-
-The `grouped` architecture uses the existing three semantic MLP heads: one each
-for upper-body, lower-body, and waistband parameters. Their outputs are packed
-back into the common prepared-data schema, so it uses the same targets,
-checkpoints, YAML conversion, rendering, and W&B metrics as the baseline.
-
-Submit it to an H100 with:
-
-```bash
-cd /is/cluster/pachar/Projects/ImageToGarment
-bash runners/condor/submit_h100.sh garment_grouped_vitl14 grouped 150
-```
-
-The Condor runner defaults to DINOv2 Large (`dinov2_vitl14`), a frozen encoder,
-light image augmentation, dropout, gradient clipping, LR reduction, early
-stopping, and checkpoints every 100 epochs. Override grouped widths with
-`HIDDEN_DIM` (shared trunk, default 512), `BRANCH_HIDDEN_DIM` (upper/lower,
-default 128), and `WAISTBAND_HIDDEN_DIM` (default 64).
-
-To visualise a grouped checkpoint over `GarmentImage` after it finishes:
-
-```bash
-cd /is/cluster/pachar/Projects/ImageToGarment
-CKPT=runs/<your_grouped_run>/best.pt
-venv/bin/python scripts/garmentimages_batch_infer.py \
-  --checkpoint "$CKPT" \
-  --architecture grouped \
-  --image-root /is/cluster/fast/pachar/Data/GarmentImage \
-  --out-dir runs/garmentimage_comparisons/grouped \
-  --device cuda \
-  --render-python venv/bin/python \
-  --garmentcode-dir GarmentCodeRC
-```
-
-The side-by-side front views are saved under
-`runs/garmentimage_comparisons/grouped/side_by_side`.
-
-
-## Train ChatGarment on GarmentCodeSMPLX
-
-The VLM converter scans `/is/cluster/fast/pachar/Data/GarmentCodeSMPLX`,
-keeps only garments with metadata, PKL, and all three readable pose images,
-and writes ChatGarment manifests with normalized sparse `[SEG]` float targets.
-Train and validation bodies must be disjoint.
-
-Prepare the currently complete samples:
-
-```bash
-cd /is/cluster/pachar/Projects/ImageToGarment
-bash scripts/prepare_chatgarment_smplx_vlm.sh
-cat /is/cluster/fast/pachar/Data/ChatGarmentSMPLXVLM/report.json
-```
-
-The command fails when the export has fewer than two train or validation bodies,
-has body overlap, or has no complete records. To inspect an incomplete export
-while rendering is still in progress:
-
-```bash
-bash scripts/prepare_chatgarment_smplx_vlm.sh --allow-incomplete
-```
-
-Once `report.json` contains `"ready": true`, make sure W&B is installed in the
-cluster venv, add your key once, and submit LLaVA-7B LoRA training:
-
-```bash
-./venv/bin/python -m pip install wandb
-cat > runners/condor/secrets.sh <<'EOF'
-export WANDB_API_KEY=your_wandb_key_here
-# export WANDB_ENTITY=your_team_or_username
-EOF
-chmod 600 runners/condor/secrets.sh
-bash runners/condor/submit_chatgarment_smplx_h100.sh smplx_vlm_lora 150
-```
-
-The job requests one 80 GB H100, 8 CPUs, 96 GB RAM, and 50 GB disk. It treats
-the three poses as independent examples, evaluates the fixed validation
-manifest after each epoch, and saves the latest DeepSpeed checkpoint under
-`runs/chatgarment_smplx/<run_name>/ckpt_model`. TensorBoard logs are in the
-same run directory, and W&B logs go to the `ImageToGarment` project by
-default. The main W&B curves are `train/loss`, `train/ce_loss`,
-`train/float_loss`, `val/loss`, `val/ce_loss`, `val/float_loss`, and
-`train/learning_rate`.
+| File | Role |
+| --- | --- |
+| `prepare_data.py` | ChatGarment preparer + `GarmentDataset` |
+| `prepare_garmentcode_smplx.py` | GarmentCodeSMPLX preparer (body-disjoint splits) |
+| `compile_balanced_garmentcode_smplx.py` | category-quota balanced compiler |
+| `compile_output_balanced_garmentcode_smplx.py` | output-space balanced compiler (keeps all garments) |
+| `compile_chatgarment_auxiliary.py` | map ChatGarment data onto an existing schema |
+| `report_balanced_dataset_requirements.py` | explain rejected folders and quota deficits |
+| `dinov2_pipeline.py` | train/infer entry point for the three DINOv2 architectures |
+| `train_dinov2.py` / `model.py` / `train_dinov2_grouped.py` | baseline / per-parameter / grouped heads |
+| `garment_tree_model.py`, `train_garment_tree.py` | GarmentTreeNet |
+| `garment_ensemble_model.py`, `train_garment_ensemble.py` | route-constrained ensemble |
+| `infer_dinov2.py`, `infer_garment_tree.py` | single-image inference (tree/ensemble auto-detected) |
+| `edit_model.py`, `prepare_edit_data.py`, `train_edit_model.py`, `infer_edit.py`, `eval_edit.py`, `edit_to_design.py` | instruction-conditioned editing |
+| `mesh_fitting_gnn.py`, `train_mesh_fitting_gnn.py`, `infer_mesh_fitting_gnn.py` | template-deformation GNN |
+| `prediction_to_yaml.py` | decode predictions into a GarmentCode design YAML |
+| `render_garmentcode.py` | headless generate + drape + render |
+| `scripts/` | data fetching, batch comparison, plotting, cluster setup |
+| `runners/` | Condor and Slurm job definitions |
